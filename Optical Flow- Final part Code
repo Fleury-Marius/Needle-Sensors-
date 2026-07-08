@@ -1,0 +1,3 @@
+Final part for the Optical Flow V1.0 is, at your computer terminal, run the following line of code: 
+pip install pyserial matplotlib numpy
+python view_frame.py <your_port> 
