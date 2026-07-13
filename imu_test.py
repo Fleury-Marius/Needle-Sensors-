@@ -1,3 +1,9 @@
+""" HOW TO VISUALIZE THE DATA: 
+After saving this code on your machine, to see the data outside 3D Slicer, 
+open your console/terminal and type (for Mac) 'python <file name>.py'. Data should be visible afterward """
+
+""" Code for running the GY-95T IMU """
+
 import serial
 import struct
 import time
