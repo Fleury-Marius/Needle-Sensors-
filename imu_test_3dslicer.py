@@ -2,8 +2,7 @@
 """ Required extension on 3D slicer: SlicerIGT and OpenIGTLink """
 '''On 3D-Slicer, make sure, when connected to the Module OpenIGTLinkIF, 
 that the scene is set to be server and Active with Port number 18944 
-(those can be changed in properties) '''
-'''Before running make sure you have changed your SERIAL_PORT for the one in 
+(those can be changed in properties) Before running, make sure you have changed your SERIAL_PORT to the one in 
 your computer'''
 
 '''Adapted code from imu_test.py to be visualized on 3d-Slicer'''
