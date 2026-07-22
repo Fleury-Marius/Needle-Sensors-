@@ -1,0 +1,110 @@
+#include <Wire.h>
+
+#define iic_add  0xa4 >> 1
+
+#define ACC_RANGE_G   16.0f
+#define ACC_SCALE     (ACC_RANGE_G / 32768.0f)
+#define ACC_G_TO_MMS2 9806.65f
+
+typedef struct __attribute__((packed))
+{
+    int16_t acc_x, acc_y, acc_z;
+    int16_t gyro_x, gyro_y, gyro_z;
+    int16_t roll, pitch, yaw;
+    uint8_t leve;
+    int16_t temp;
+    int16_t mag_x, mag_y, mag_z;
+} gy;
+
+gy my_95Q;
+
+unsigned int delay_t = 0;
+volatile byte ready_Ok = 0;
+
+// ---------------- Kalman Filter ----------------
+typedef struct {
+    float q, r, x, p, k;
+} KalmanFilter;
+
+void kalmanInit(KalmanFilter *kf, float q, float r, float p) {
+    kf->q = q; kf->r = r; kf->x = 0.0f; kf->p = p;
+}
+
+float kalmanUpdate(KalmanFilter *kf, float measurement) {
+    kf->p += kf->q;
+    kf->k = kf->p / (kf->p + kf->r);
+    kf->x += kf->k * (measurement - kf->x);
+    kf->p *= (1.0f - kf->k);
+    return kf->x;
+}
+
+// Filters
+KalmanFilter kf_acc_x, kf_acc_y;
+KalmanFilter kf_gyro_x, kf_gyro_y, kf_gyro_z;
+
+void setup() {
+    Serial.begin(9600);
+    Wire.begin();
+
+    attachInterrupt(0, Exti, RISING);
+
+    kalmanInit(&kf_acc_x, 0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_acc_y, 0.02f, 0.05f, 10.0f);
+
+    kalmanInit(&kf_gyro_x, 0.05f, 0.5f, 10.0f);
+    kalmanInit(&kf_gyro_y, 0.05f, 0.5f, 10.0f);
+    kalmanInit(&kf_gyro_z, 0.05f, 0.5f, 10.0f);
+}
+
+void loop() {
+    if (!ready_Ok) return;
+    ready_Ok = 0;
+
+    unsigned char data[27] = {0};
+
+    if (!iic_read(0x08, data, 27)) return;
+    memcpy(&my_95Q, data, 27);
+
+    // --- Accel ---
+    float acc_x = my_95Q.acc_x * ACC_SCALE;
+    float acc_y = my_95Q.acc_y * ACC_SCALE;
+    float acc_z = my_95Q.acc_z * ACC_SCALE;
+
+    float acc_x_f = kalmanUpdate(&kf_acc_x, acc_x);
+    float acc_y_f = kalmanUpdate(&kf_acc_y, acc_y);
+
+    float ax = acc_x_f * ACC_G_TO_MMS2;
+    float ay = acc_y_f * ACC_G_TO_MMS2;
+    float az = acc_z * ACC_G_TO_MMS2;
+
+    // --- Gyro ---
+    float gx = kalmanUpdate(&kf_gyro_x, my_95Q.gyro_x);
+    float gy = kalmanUpdate(&kf_gyro_y, my_95Q.gyro_y);
+    float gz = kalmanUpdate(&kf_gyro_z, my_95Q.gyro_z);
+
+    // --- Output ---
+    Serial.print("ax:"); Serial.print(ax);
+    Serial.print(",ay:"); Serial.print(ay);
+    Serial.print(",az:"); Serial.print(az);
+
+    Serial.print(",gx:"); Serial.print(gx);
+    Serial.print(",gy:"); Serial.print(gy);
+    Serial.print(",gz:"); Serial.print(gz);
+
+    Serial.print(",roll:"); Serial.print(my_95Q.roll / 100.0);
+    Serial.print(",pitch:"); Serial.print(my_95Q.pitch / 100.0);
+    Serial.print(",yaw:"); Serial.println(my_95Q.yaw / 100.0);
+}
+
+void Exti() { ready_Ok = 1; }
+
+bool iic_read(unsigned char add, unsigned char *data, unsigned char len) {
+    Wire.beginTransmission(iic_add);
+    Wire.write(add);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    if (Wire.requestFrom(iic_add, (int)len) != len) return false;
+
+    for (byte j = 0; j < len; j++) *data++ = Wire.read();
+    return true;
+}
