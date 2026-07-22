@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Jul 22 09:42:55 2026
+Updated same day: added a fixed mounting rotation so the syringe rests
+pointing forward (horizontal) instead of straight up, and made the
+rotation pivot configurable (tip or center) instead of always being the
+model's local origin (the base).
+
+@author: mariofleury
+"""
+
+"""
+Paste this into Slicer's Python Interactor (View > Python Interactor),
+AFTER you've connected to the combined GY-95T + dual-VL6180X Arduino sketch
+via the ArduinoConnect module (Extension Manager > install
+"ArduinoController" if you haven't already, then use the ArduinoConnect
+module to connect at 115200 baud).
+
+IMPORTANT: This version replaces the generated blue cube with your
+uploaded "Syringe_fc.stl" model. Make sure that STL is already loaded into
+the scene (File > Add Data, or drag-and-drop it into Slicer) BEFORE running
+this script. By default Slicer names the resulting model node after the
+filename minus its extension, i.e. "Syringe_fc". If you renamed the node
+after loading it, update STL_NODE_NAME below to match.
+
+If the node truly can't be found, the script will try to load it directly
+from STL_FILE_PATH as a fallback -- set that to the file's location on your
+machine if you want that safety net.
+
+This script:
+  1. Finds your syringe model node (or loads it from disk as a fallback).
+  2. Creates a linear transform node (if one doesn't already exist) and
+     parents the syringe model to it.
+  3. Creates TWO "probe" tube models, one per VL6180X sensor, mounted on
+     the syringe, offset from each other so they don't overlap.
+  4. Parses every field the combined Arduino sketch prints: acc_x/y
+     (filtered, mm/s^2), acc_z, roll, pitch, yaw, temp, leve, mag_x/y/z,
+     distance_mm (sensor1), distance_mm2 (sensor2). Raw/unfiltered fields
+     are still parsed if present in the line but are not displayed.
+  5. Rotates the syringe + both probes live from roll/pitch/yaw, on top of
+     a fixed MOUNT_ROTATION so the model rests pointing forward (world +Y)
+     rather than straight up (world +Z), and about a configurable pivot
+     point (PIVOT_LOCAL_POS) instead of the model's local origin.
+  6. Scales each probe's length to its own live distance reading and colors
+     it green/yellow/red depending on how close the sensed object is.
+  7. Overlays filtered values and both distances as text in the 3D view's
+     corner.
+If your Arduino node isn't named "arduinoNode", change ARDUINO_NODE_NAME
+below (check the Data module tree after connecting to see the actual name).
+"""
+
+import numpy as np
+import vtk
+import slicer
+
+ARDUINO_NODE_NAME = "arduinoNode"      # <-- rename if yours differs
+TRANSFORM_NODE_NAME = "GY95TTransform"
+
+# --- Syringe model node (replaces the old generated cube) ---
+STL_NODE_NAME = "Syringe_fc"   # <-- Slicer's default name for Syringe_fc.stl
+# Only used as a fallback if the node above isn't already in the scene.
+# Set this to wherever the STL lives on YOUR machine, e.g.:
+# STL_FILE_PATH = r"C:\Users\you\Downloads\Syringe_fc.stl"
+STL_FILE_PATH = None
+
+PROBE1_NODE_NAME = "VL6180XProbe1"
+PROBE2_NODE_NAME = "VL6180XProbe2"
+
+# --- Sensor mount geometry (in the model's LOCAL coordinate frame, mm) ---
+# ASSUMPTION: I don't know exactly where on the syringe body you're mounting
+# the two VL6180X sensors, so these are placeholders based on the STL's own
+# bounding box (measured: X spans about -6.3 to 6.3, Y about -9 to 9, Z runs
+# from 0 at the base/plunger end up to about 147.6 at the tip/needle end --
+# note this is NOT centered on the origin like the old cube was).
+#
+# Defaults below mount both probes near the tip (Z ~ 147), pointing further
+# out along +Z in the model's LOCAL frame (i.e. out past the needle, in
+# local coordinates -- MOUNT_ROTATION below re-aims local +Z to world +Y at
+# rest, so these still point "out past the needle" once mounted).
+# Edit these to match your actual sensor placement.
+SENSOR1_LOCAL_POS = (3.0, 0.0, 145.0)   # near tip, offset +X
+SENSOR1_LOCAL_DIR = (0.0, 0.0, 1.0)     # pointing local +Z (out past the tip)
+SENSOR2_LOCAL_POS = (-3.0, 0.0, 145.0)  # near tip, offset -X
+SENSOR2_LOCAL_DIR = (0.0, 0.0, 1.0)     # pointing local +Z (same direction)
+
+# VL6180X default range is roughly 0-200mm; clamp the drawn probe so a
+# stray/out-of-range reading doesn't stretch the line off into space.
+PROBE_MAX_MM = 250.0
+PROBE_RADIUS_MM = 1.0  # thinner than before, to suit the syringe's small scale
+
+# Proximity color thresholds (mm) for each probe.
+PROBE_NEAR_MM = 50.0
+PROBE_MID_MM = 150.0
+
+# --- Mounting rotation (fixes default orientation) ---
+# The model's local +Z axis is its long axis (base at Z=0 up to the tip at
+# Z~147.6). With no mounting correction, local +Z maps straight onto world
+# +Z (Superior / "up" in Slicer's RAS view) whenever roll=pitch=yaw=0 --
+# that's why the syringe rested pointing straight up in your screenshot.
+#
+# This constant rotation is applied to the model BEFORE the live IMU
+# rotation each frame, so that at rest (roll=pitch=yaw=0) local +Z instead
+# points along world +Y (Anterior / "forward", matching the "A" label in
+# the 3D view). The live IMU rotation still tilts/spins it from there
+# exactly as before.
+#
+# If "forward" means a different world axis for your camera/setup (e.g. you
+# want it resting along -Y, or along X), swap this matrix accordingly --
+# it's just a rotation matrix that sends local (0,0,1) to whichever world
+# direction you want "forward" to be.
+MOUNT_ROTATION = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0],
+])  # sends local +Z -> world +Y ("forward"/Anterior) at rest
+
+# --- Rotation pivot, in the model's LOCAL coordinate frame (mm) ---
+# By default (no explicit translation) Slicer rotates the model about its
+# local origin (0,0,0), which per the STL's own frame is the base/plunger
+# end -- that's the "I" end you saw everything swinging around in the
+# screenshot.
+#
+# PIVOT_LOCAL_POS below stays FIXED in world space while the rest of the
+# model rotates around it. Two ready-made choices are given; edit
+# STL_Z_MIN/STL_Z_MAX if your model's actual bounding box differs from the
+# measurements in the comment above.
+STL_Z_MIN = 0.0
+STL_Z_MAX = 147.6
+PIVOT_TIP = (0.0, 0.0, STL_Z_MAX)
+PIVOT_CENTER = (0.0, 0.0, (STL_Z_MIN + STL_Z_MAX) / 2.0)
+
+PIVOT_LOCAL_POS = PIVOT_CENTER   # <-- switch to PIVOT_TIP to pivot from the needle tip instead
+
+
+def parse_line(raw):
+    """Parses 'key: value, key: value, ...' lines into a dict of floats."""
+    data = {}
+    for token in raw.split(","):
+        if ":" not in token:
+            continue
+        key, val = token.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        try:
+            data[key] = float(val)
+        except ValueError:
+            pass
+    return data
+
+
+def euler_to_rotation_matrix(roll_deg, pitch_deg, yaw_deg):
+    r = np.radians(roll_deg)
+    p = np.radians(pitch_deg)
+    y = np.radians(yaw_deg)
+
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(r), -np.sin(r)],
+        [0, np.sin(r), np.cos(r)],
+    ])
+    Ry = np.array([
+        [np.cos(p), 0, np.sin(p)],
+        [0, 1, 0],
+        [-np.sin(p), 0, np.cos(p)],
+    ])
+    Rz = np.array([
+        [np.cos(y), -np.sin(y), 0],
+        [np.sin(y), np.cos(y), 0],
+        [0, 0, 1],
+    ])
+    return Rz @ Ry @ Rx
+
+
+def get_or_create_transform(name):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None:
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        print(f"Created transform node '{name}'.")
+    return node
+
+
+def get_or_load_syringe(name, file_path, transform_node):
+    """Finds the already-loaded syringe model node, parenting it to the
+    transform. Falls back to loading it from file_path if it's not in the
+    scene yet."""
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None and file_path:
+        print(f"Node '{name}' not found in scene; loading from '{file_path}'...")
+        node = slicer.util.loadModel(file_path)
+        if node is not None:
+            node.SetName(name)
+
+    if node is None:
+        raise RuntimeError(
+            f"Could not find a model node named '{name}' in the scene, and no "
+            "STL_FILE_PATH was given to load it from. Load Syringe_fc.stl into "
+            "Slicer first (File > Add Data), or set STL_FILE_PATH at the top "
+            "of this script."
+        )
+
+    node.SetAndObserveTransformNodeID(transform_node.GetID())
+    return node
+
+
+def _build_probe_pipeline(local_pos, local_dir):
+    """Builds a line+tube VTK pipeline from local_pos out along local_dir."""
+    dir_arr = np.array(local_dir, dtype=float)
+    norm = np.linalg.norm(dir_arr)
+    unit_dir = dir_arr / norm if norm > 0 else np.array([0.0, 0.0, 1.0])
+
+    lineSource = vtk.vtkLineSource()
+    lineSource.SetPoint1(*local_pos)
+    p2 = np.array(local_pos) + unit_dir * PROBE_RADIUS_MM  # placeholder length
+    lineSource.SetPoint2(*p2)
+    lineSource.Update()
+
+    tubeFilter = vtk.vtkTubeFilter()
+    tubeFilter.SetInputConnection(lineSource.GetOutputPort())
+    tubeFilter.SetRadius(PROBE_RADIUS_MM)
+    tubeFilter.SetNumberOfSides(12)
+    tubeFilter.CappingOn()
+    tubeFilter.Update()
+
+    return lineSource, tubeFilter, tuple(local_pos), unit_dir
+
+
+def get_or_create_probe(name, transform_node, local_pos, local_dir):
+    """A tube from local_pos out along local_dir, length = live distance.
+
+    Stored as attributes on the node so the update loop doesn't need module-
+    level globals for the VTK source/filter objects.
+    """
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None:
+        lineSource, tubeFilter, origin, unit_dir = _build_probe_pipeline(local_pos, local_dir)
+
+        node = slicer.modules.models.logic().AddModel(tubeFilter.GetOutputPort())
+        node.SetName(name)
+        node.GetDisplayNode().SetColor(0.2, 1.0, 0.2)
+        print(f"Created probe model '{name}'.")
+
+        node._lineSource = lineSource
+        node._tubeFilter = tubeFilter
+        node._origin = origin
+        node._unitDir = unit_dir
+    else:
+        # Node persisted from a previous run of this script in the same
+        # session; VTK pipeline objects aren't persisted on the MRML node,
+        # so python-side attributes would be gone too. Rebuild them.
+        if not hasattr(node, "_lineSource"):
+            lineSource, tubeFilter, origin, unit_dir = _build_probe_pipeline(local_pos, local_dir)
+            node._lineSource = lineSource
+            node._tubeFilter = tubeFilter
+            node._origin = origin
+            node._unitDir = unit_dir
+
+    node.SetAndObserveTransformNodeID(transform_node.GetID())
+    return node
+
+
+class GY95TController:
+    def __init__(self, arduino_node_name=ARDUINO_NODE_NAME):
+        self.arduinoNode = slicer.mrmlScene.GetFirstNodeByName(arduino_node_name)
+        if self.arduinoNode is None:
+            raise RuntimeError(
+                f"Could not find node '{arduino_node_name}'. "
+                "Make sure ArduinoConnect is connected first."
+            )
+
+        self.transformNode = get_or_create_transform(TRANSFORM_NODE_NAME)
+        self.syringeNode = get_or_load_syringe(STL_NODE_NAME, STL_FILE_PATH, self.transformNode)
+        self.probe1Node = get_or_create_probe(
+            PROBE1_NODE_NAME, self.transformNode, SENSOR1_LOCAL_POS, SENSOR1_LOCAL_DIR
+        )
+        self.probe2Node = get_or_create_probe(
+            PROBE2_NODE_NAME, self.transformNode, SENSOR2_LOCAL_POS, SENSOR2_LOCAL_DIR
+        )
+
+        self.matrix = vtk.vtkMatrix4x4()
+        self.pivot = np.array(PIVOT_LOCAL_POS, dtype=float)
+
+        # Apply the mount rotation + pivot once immediately, so the model
+        # sits correctly (forward-facing, pivoted at the chosen point) even
+        # before the first Arduino update comes in.
+        self._applyRotation(np.eye(3))
+
+        # Center the 3D view on the syringe once, so it's actually in frame.
+        layoutManager = slicer.app.layoutManager()
+        threeDWidget = layoutManager.threeDWidget(0)
+        self.threeDView = threeDWidget.threeDView()
+        threeDWidget.threeDController().resetFocalPoint()
+
+        self.observerTag = self.arduinoNode.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self.onArduinoDataUpdated
+        )
+        print("GY95TController is running. Move the syringe / wave a hand in front of either VL6180X.")
+
+    def _applyRotation(self, R_live):
+        """Combines the live IMU rotation with the fixed mount rotation,
+        then offsets translation so PIVOT_LOCAL_POS stays fixed in world
+        space while everything else rotates around it."""
+        R = R_live @ MOUNT_ROTATION
+        translation = self.pivot - R @ self.pivot
+
+        for i in range(3):
+            for j in range(3):
+                self.matrix.SetElement(i, j, R[i, j])
+            self.matrix.SetElement(i, 3, translation[i])
+        self.transformNode.SetMatrixTransformToParent(self.matrix)
+
+    def _updateProbe(self, probeNode, distance_mm):
+        distance_mm = max(0.0, min(distance_mm, PROBE_MAX_MM))
+
+        lineSource = probeNode._lineSource
+        tubeFilter = probeNode._tubeFilter
+        origin = np.array(probeNode._origin)
+        unit_dir = probeNode._unitDir
+
+        length = max(distance_mm, 0.01)  # avoid zero-length tube
+        p2 = origin + unit_dir * length
+        lineSource.SetPoint2(*p2)
+        lineSource.Update()
+        tubeFilter.Update()
+        probeNode.SetAndObservePolyData(tubeFilter.GetOutput())
+
+        if distance_mm < PROBE_NEAR_MM:
+            color = (1.0, 0.2, 0.2)   # red: something close
+        elif distance_mm < PROBE_MID_MM:
+            color = (1.0, 0.85, 0.2)  # yellow: mid-range
+        else:
+            color = (0.2, 1.0, 0.2)   # green: clear / far
+        probeNode.GetDisplayNode().SetColor(*color)
+
+    def onArduinoDataUpdated(self, caller, event):
+        raw = self.arduinoNode.GetParameter("Data")
+        if not raw:
+            return
+
+        data = parse_line(raw)
+        if not all(k in data for k in ("roll", "pitch", "yaw")):
+            return  # incomplete line, skip
+
+        # --- Update syringe + both probes' orientation ---
+        R_live = euler_to_rotation_matrix(data["roll"], data["pitch"], data["yaw"])
+        self._applyRotation(R_live)
+
+        # --- Update each VL6180X range probe, if a reading was in this line ---
+        if "distance_mm" in data:
+            self._updateProbe(self.probe1Node, data["distance_mm"])
+        if "distance_mm2" in data:
+            self._updateProbe(self.probe2Node, data["distance_mm2"])
+
+        # --- Update on-screen data overlay (top-left corner of 3D view) ---
+        # Raw/unfiltered fields are intentionally omitted here.
+        text = (
+            f"Roll: {data.get('roll', 0):.2f}  "
+            f"Pitch: {data.get('pitch', 0):.2f}  "
+            f"Yaw: {data.get('yaw', 0):.2f}\n"
+            f"Accel (mm/s^2)  X: {data.get('acc_x', 0):.0f}  "
+            f"Y: {data.get('acc_y', 0):.0f}  "
+            f"Z: {data.get('acc_z', 0):.0f}\n"
+            f"Mag    X: {data.get('mag_x', 0):.0f}  "
+            f"Y: {data.get('mag_y', 0):.0f}  "
+            f"Z: {data.get('mag_z', 0):.0f}\n"
+            f"Temp: {data.get('temp', 0):.2f} C   Level: {data.get('leve', 0):.0f}\n"
+            f"Distance 1: {data.get('distance_mm', float('nan')):.0f} mm\n"
+            f"Distance 2: {data.get('distance_mm2', float('nan')):.0f} mm"
+        )
+        self.threeDView.cornerAnnotation().SetText(2, text)  # 2 = upper-left
+        self.threeDView.cornerAnnotation().GetTextProperty().SetColor(1, 1, 1)
+        self.threeDView.forceRender()
+
+    def stop(self):
+        self.arduinoNode.RemoveObserver(self.observerTag)
+
+
+# Instantiate to start live updates. Keep the reference (don't let it get
+# garbage collected) or the observer stops firing.
+controller = GY95TController()
+
+# To stop later:
+# controller.stop()
