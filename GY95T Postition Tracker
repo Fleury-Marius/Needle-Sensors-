@@ -1,0 +1,684 @@
+/* =====================================================================
+ * GY-95T -> 3D Slicer : orientation + dead-reckoned position
+ * Target: Arduino UNO (ATmega328P)
+ * ---------------------------------------------------------------------
+ * FIXES IN THIS REVISION (v3), after "# Calibrating..." and then silence:
+ *
+ *  a) I2C CLOCK BACK TO 100 kHz. The previous revision called
+ *     Wire.setClock(400000). Plenty of GY-95T wiring (long jumpers, weak
+ *     pull-ups, breadboard) will not survive 400 kHz: every iic_read()
+ *     then returns false, calibrate() collects zero samples, loop()
+ *     bails on every pass, and the sketch goes permanently quiet -
+ *     exactly the symptom in your Serial Monitor. Fast mode is now
+ *     opt-in via I2C_CLOCK_HZ, defaulting to the standard 100 kHz.
+ *
+ *  b) POLLING FALLBACK FOR THE DATA-READY INTERRUPT. If the module's INT
+ *     pin is not on D2 (or is not toggling), ready_Ok never gets set and
+ *     nothing ever runs. The sketch now falls back to timed polling so
+ *     it works either way. Set USE_POLL_FALLBACK to 0 to force
+ *     interrupt-only operation.
+ *
+ *  c) HEARTBEAT DIAGNOSTICS. If no good sample arrives for 2 seconds,
+ *     the sketch says so and reports interrupt count and I2C failure
+ *     count, so you can tell wiring problems from bus problems instead
+ *     of staring at a blank monitor.
+ *
+ *  d) VERBOSE_STARTUP. Human-readable startup lines are useful in the
+ *     Serial Monitor and are a liability for ArduinoConnect, which is
+ *     parsing this stream. SET THIS TO 0 BEFORE CONNECTING SLICER so the
+ *     board emits nothing but well-formed key:value lines.
+ *
+ *  e) SEND_MAG / SEND_VEL trim the line length if the host struggles.
+ *
+ * Note on the garbage bytes before "# Calibrating": that is the UNO
+ * bootloader, which also talks at 115200 on reset. It is unavoidable and
+ * harmless to a parser that ignores malformed lines.
+ *
+ * HONEST LIMITATION, unchanged: with no distance sensors there is no
+ * absolute position reference. ZUPT, bias tracking and the velocity leak
+ * bound the drift; they do not remove it. Expect a few believable seconds
+ * after each rest. Do not read the position field as where the needle is.
+ * ===================================================================== */
+
+#include <Wire.h>
+#include <math.h>
+
+#define iic_add  (0xa4 >> 1)
+
+/* ---------------- User-tunable ---------------- */
+
+#define SERIAL_BAUD       9600  // must match ArduinoConnect
+#define PRINT_HZ          20       // serial output rate
+
+#define VERBOSE_STARTUP   1        // 1 = diagnostics; 0 = data lines ONLY (use for Slicer)
+#define SEND_MAG          1
+#define SEND_VEL          1
+
+// 100000 is standard mode and is what your wiring almost certainly wants.
+// Only try 400000 if everything works at 100000 first.
+#define I2C_CLOCK_HZ      100000L
+
+// If the data-ready interrupt on D2 is absent or silent, poll instead.
+#define USE_POLL_FALLBACK 1
+
+#define ACC_RANGE_G     16.0f
+#define ACC_SCALE       (ACC_RANGE_G / 32768.0f)
+#define ACC_G_TO_MMS2   9806.65f
+
+#define GYRO_RANGE_DPS  2000.0f
+#define GYRO_SCALE      (GYRO_RANGE_DPS / 32768.0f)
+
+#define GRAVITY_SIGN    1.0f
+
+#define Q_ACCEL_VAR     4000.0f
+
+// Velocity leak time constant, seconds. This is the knob that decides
+// whether slow sustained translation survives. 1.5 was too aggressive:
+// a 2-second forward push lost most of its displacement to the leak.
+// Larger = slow motion is reported faithfully but drift grows. 0 = off.
+#define VEL_TAU_S       4.0f
+
+// A moving device at CONSTANT velocity is physically indistinguishable
+// from a stationary one: both read |a| = 1g with no rotation. So the
+// coast phase in the middle of a deliberate translation looks exactly
+// like rest, and a hair-trigger ZUPT zeroes your velocity mid-move -
+// which is why forward/backward went missing. Requiring the stationary
+// condition to hold continuously for this long before trusting it lets
+// coasting through while still catching genuine rest.
+#define STAT_HOLD_MS    300UL
+
+// Yaw comes from the magnetometer and wanders indoors, near steel, and
+// near the USB cable. World X/Y rotate with it, so "forward" smears
+// between axes as it drifts. Capturing a heading reference at startup
+// makes world +X mean "the way the device was pointing at boot".
+#define ZERO_YAW_AT_START 1
+
+// Publish world-frame acceleration. Watch these while you push the
+// device forward: if they move, sensing is fine and integration is at
+// fault; if they stay in the noise, the motion is too gentle to detect.
+#define SEND_WORLD_ACC  1
+
+#define CAL_SAMPLES     200
+#define STAT_WIN        8
+#define BIAS_TRACK_A    0.02f
+
+#define DIAG_PERIOD_MS  2000UL
+
+/* ---------------------------------------------------------------------
+ * Typedefs stay at the top: the Arduino IDE injects auto-generated
+ * prototypes near the top of the file, and any type used in a function
+ * signature must already be visible there.
+ * ------------------------------------------------------------------- */
+
+typedef struct __attribute__((packed))
+{
+    int16_t acc_x;
+    int16_t acc_y;
+    int16_t acc_z;
+    int16_t gyro_x;
+    int16_t gyro_y;
+    int16_t gyro_z;
+    int16_t roll;
+    int16_t pitch;
+    int16_t yaw;
+    uint8_t leve;
+    int16_t temp;
+    int16_t mag_x;
+    int16_t mag_y;
+    int16_t mag_z;
+} gy;
+
+typedef struct
+{
+    float q;
+    float r;
+    float x;
+    float p;
+    float k;
+} KalmanFilter;
+
+typedef struct
+{
+    float pos;
+    float vel;
+    float P[2][2];
+} PosVelKF;
+
+gy my_95Q;
+unsigned int delay_t = 20;
+volatile byte ready_Ok = 0;
+volatile unsigned long int_count = 0;
+
+unsigned long i2c_fail_count = 0;
+unsigned long sample_count = 0;
+unsigned long last_sample_ms = 0;
+unsigned long last_diag_ms = 0;
+unsigned long last_update_us = 0;
+unsigned long last_print_ms = 0;
+bool calibrated = false;
+
+/* ---------------- Scalar Kalman (display smoothing) ----------------- */
+
+void kalmanInit(KalmanFilter *kf, float process_noise, float measurement_noise, float initial_p)
+{
+    kf->q = process_noise;
+    kf->r = measurement_noise;
+    kf->x = 0.0f;
+    kf->p = initial_p;
+}
+
+float kalmanUpdate(KalmanFilter *kf, float measurement)
+{
+    kf->p = kf->p + kf->q;
+    kf->k = kf->p / (kf->p + kf->r);
+    kf->x = kf->x + kf->k * (measurement - kf->x);
+    kf->p = (1.0f - kf->k) * kf->p;
+    return kf->x;
+}
+
+KalmanFilter kf_acc_x, kf_acc_y, kf_acc_z;
+KalmanFilter kf_gyro_x, kf_gyro_y, kf_gyro_z;
+
+/* ---------------- Position / velocity filter ------------------------ */
+
+void posvelInit(PosVelKF *kf, float pos0, float vel0, float pos_var0, float vel_var0)
+{
+    kf->pos = pos0;
+    kf->vel = vel0;
+    kf->P[0][0] = pos_var0; kf->P[0][1] = 0.0f;
+    kf->P[1][0] = 0.0f;     kf->P[1][1] = vel_var0;
+}
+
+void posvelPredict(PosVelKF *kf, float accel, float dt, float q_accel_var)
+{
+    kf->pos += kf->vel * dt + 0.5f * accel * dt * dt;
+    kf->vel += accel * dt;
+
+    float dt2 = dt * dt;
+    float dt3 = dt2 * dt;
+    float dt4 = dt3 * dt;
+
+    float Qpp = 0.25f * dt4 * q_accel_var;
+    float Qpv = 0.5f  * dt3 * q_accel_var;
+    float Qvv = dt2 * q_accel_var;
+
+    float P00 = kf->P[0][0], P01 = kf->P[0][1];
+    float P10 = kf->P[1][0], P11 = kf->P[1][1];
+
+    kf->P[0][0] = P00 + dt * (P01 + P10) + dt2 * P11 + Qpp;
+    kf->P[0][1] = P01 + dt * P11 + Qpv;
+    kf->P[1][0] = P10 + dt * P11 + Qpv;
+    kf->P[1][1] = P11 + Qvv;
+}
+
+// Zero-velocity update: the only thing bounding drift now.
+void posvelZUPT(PosVelKF *kf, float vel_var_after_zupt)
+{
+    kf->vel = 0.0f;
+    kf->P[1][1] = vel_var_after_zupt;
+    kf->P[0][1] = 0.0f;
+    kf->P[1][0] = 0.0f;
+}
+
+void posvelLeak(PosVelKF *kf, float leak)
+{
+    kf->vel *= leak;
+}
+
+PosVelKF kf_pos_x, kf_pos_y, kf_pos_z;
+
+/* ---------------- Stationary detector ------------------------------- */
+
+float acc_hist[STAT_WIN];
+float gyr_hist[STAT_WIN];
+uint8_t hist_i = 0;
+uint8_t hist_n = 0;
+
+float tol_acc_offset = 0.02f;   // g
+float tol_acc_std    = 0.01f;   // g
+float tol_gyro       = 5.0f;    // deg/s
+
+void statPush(float acc_mag_g, float gyro_mag_dps)
+{
+    acc_hist[hist_i] = acc_mag_g;
+    gyr_hist[hist_i] = gyro_mag_dps;
+    hist_i = (hist_i + 1) % STAT_WIN;
+    if (hist_n < STAT_WIN) hist_n++;
+}
+
+bool statIsStationary()
+{
+    if (hist_n < STAT_WIN) return false;
+
+    float mean_a = 0.0f, mean_g = 0.0f;
+    for (uint8_t i = 0; i < STAT_WIN; i++) { mean_a += acc_hist[i]; mean_g += gyr_hist[i]; }
+    mean_a /= STAT_WIN;
+    mean_g /= STAT_WIN;
+
+    float var_a = 0.0f;
+    for (uint8_t i = 0; i < STAT_WIN; i++) {
+        float d = acc_hist[i] - mean_a;
+        var_a += d * d;
+    }
+    var_a /= STAT_WIN;
+
+    return (fabs(mean_a - 1.0f) < tol_acc_offset)
+        && (sqrt(var_a)        < tol_acc_std)
+        && (mean_g             < tol_gyro);
+}
+
+/* ---------------- World-frame accel bias ---------------------------- */
+
+float acc_bias_world_x = 0.0f;
+float acc_bias_world_y = 0.0f;
+float acc_bias_world_z = 0.0f;
+
+float yaw_ref_deg = 0.0f;          // heading captured at startup
+unsigned long stationary_since_ms = 0;
+
+// Heading used for the world transform, relative to the startup heading.
+float referencedYaw()
+{
+#if ZERO_YAW_AT_START
+    return (my_95Q.yaw / 100.0f) - yaw_ref_deg;
+#else
+    return my_95Q.yaw / 100.0f;
+#endif
+}
+
+/* ---------------------------------------------------------------------
+ * Rotate a body-frame vector into the world frame using the module's own
+ * fused roll/pitch/yaw (degrees), ZYX convention.
+ *
+ * If integrated position moves in a direction that does not match real
+ * motion, this function's axis convention is the first suspect.
+ * ------------------------------------------------------------------- */
+void rotateBodyToWorld(float ax, float ay, float az,
+                       float roll_deg, float pitch_deg, float yaw_deg,
+                       float *wx, float *wy, float *wz)
+{
+    float roll  = roll_deg  * 0.017453293f;
+    float pitch = pitch_deg * 0.017453293f;
+    float yaw   = yaw_deg   * 0.017453293f;
+
+    float cr = cos(roll),  sr = sin(roll);
+    float cp = cos(pitch), sp = sin(pitch);
+    float cy = cos(yaw),   sy = sin(yaw);
+
+    *wx = (cy*cp)*ax + (cy*sp*sr - sy*cr)*ay + (cy*sp*cr + sy*sr)*az;
+    *wy = (sy*cp)*ax + (sy*sp*sr + cy*cr)*ay + (sy*sp*cr - cy*sr)*az;
+    *wz = (-sp)*ax   + (cp*sr)*ay            + (cp*cr)*az;
+}
+
+/* ---------------- Sample acquisition -------------------------------- */
+
+// True when a fresh sample is available, either from the data-ready
+// interrupt or, if that pin is silent, from the polling fallback.
+bool sampleReady()
+{
+    if (ready_Ok) {
+        ready_Ok = 0;
+        return true;
+    }
+#if USE_POLL_FALLBACK
+    if (millis() - last_sample_ms >= (unsigned long)(delay_t)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
+// Reads the 27-byte block. Returns false on bus failure.
+bool readIMU()
+{
+    unsigned char data[27] = {0};
+    if (!iic_read(0x08, data, 27)) {
+        i2c_fail_count++;
+        return false;
+    }
+    memcpy(&my_95Q, data, 27);
+    last_sample_ms = millis();
+    sample_count++;
+    return true;
+}
+
+void serviceDiagnostics()
+{
+#if VERBOSE_STARTUP
+    unsigned long now = millis();
+    if (now - last_diag_ms < DIAG_PERIOD_MS) return;
+    last_diag_ms = now;
+
+    if (sample_count > 0) {
+        sample_count = 0;
+        return;                      // healthy: stay quiet
+    }
+
+    Serial.print(F("# NO DATA. int_fires="));
+    Serial.print(int_count);
+    Serial.print(F(" i2c_fails="));
+    Serial.print(i2c_fail_count);
+    if (int_count == 0) {
+        Serial.print(F("  -> data-ready pin is not reaching D2"));
+    } else if (i2c_fail_count > 0) {
+        Serial.print(F("  -> I2C reads failing: check SDA/SCL, pull-ups, address, wire length"));
+    }
+    Serial.println();
+    i2c_fail_count = 0;
+#endif
+}
+
+/* ---------------- Startup calibration ------------------------------- */
+
+void calibrate()
+{
+#if VERBOSE_STARTUP
+    Serial.println(F("# Calibrating - hold the device COMPLETELY still..."));
+#endif
+
+    int   collected = 0;
+    float sum_wx = 0, sum_wy = 0, sum_wz = 0;
+    float sum_am = 0, sum_am2 = 0;
+    float sum_gm = 0, sum_gm2 = 0;
+    unsigned long cal_start = millis();
+
+    while (collected < CAL_SAMPLES && millis() - cal_start < 8000UL) {
+        if (!sampleReady()) continue;
+        if (!readIMU())     continue;
+
+        if (collected == 0) {
+            yaw_ref_deg = my_95Q.yaw / 100.0f;   // heading reference
+        }
+
+        float ax_g = my_95Q.acc_x * ACC_SCALE;
+        float ay_g = my_95Q.acc_y * ACC_SCALE;
+        float az_g = my_95Q.acc_z * ACC_SCALE;
+
+        float wx, wy, wz;
+        rotateBodyToWorld(ax_g, ay_g, az_g,
+                          my_95Q.roll  / 100.0f,
+                          my_95Q.pitch / 100.0f,
+                          referencedYaw(),
+                          &wx, &wy, &wz);
+
+        sum_wx += wx; sum_wy += wy; sum_wz += wz;
+
+        float am = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+        sum_am  += am;
+        sum_am2 += am * am;
+
+        float gx  = my_95Q.gyro_x * GYRO_SCALE;
+        float gy_ = my_95Q.gyro_y * GYRO_SCALE;
+        float gz  = my_95Q.gyro_z * GYRO_SCALE;
+        float gm  = sqrt(gx*gx + gy_*gy_ + gz*gz);
+        sum_gm  += gm;
+        sum_gm2 += gm * gm;
+
+        collected++;
+    }
+
+    sample_count = 0;
+
+    if (collected < 20) {
+#if VERBOSE_STARTUP
+        Serial.print(F("# CALIBRATION FAILED. samples="));
+        Serial.print(collected);
+        Serial.print(F(" int_fires="));
+        Serial.print(int_count);
+        Serial.print(F(" i2c_fails="));
+        Serial.println(i2c_fail_count);
+        Serial.println(F("# Running anyway with zero bias. Fix the bus/wiring, then reset."));
+#endif
+        return;
+    }
+
+    float n = (float)collected;
+
+    acc_bias_world_x = (sum_wx / n) * ACC_G_TO_MMS2;
+    acc_bias_world_y = (sum_wy / n) * ACC_G_TO_MMS2;
+    acc_bias_world_z = ((sum_wz / n) - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
+
+    float mean_am = sum_am / n;
+    float std_am  = sqrt(fmax(0.0f, sum_am2 / n - mean_am * mean_am));
+    float mean_gm = sum_gm / n;
+    float std_gm  = sqrt(fmax(0.0f, sum_gm2 / n - mean_gm * mean_gm));
+
+    // Raise these multipliers if ZUPT never fires; lower them if it fires
+    // while you are genuinely moving.
+    // Floors raised: your gyro sits around 1.7 deg/s at rest, which the
+    // old 1.0 floor rejected, so ZUPT never fired and the Z bias
+    // integrated downward unopposed until it hit the clamp.
+    tol_acc_std    = fmax(3.0f * std_am, 0.003f);
+    tol_acc_offset = fmax(6.0f * std_am, 0.012f);
+    tol_gyro       = fmax(mean_gm + 6.0f * std_gm, 3.0f);
+
+    calibrated = true;
+
+#if VERBOSE_STARTUP
+    Serial.print(F("# OK samples=")); Serial.println(collected);
+    Serial.print(F("# Bias mm/s^2 x=")); Serial.print(acc_bias_world_x, 2);
+    Serial.print(F(" y="));              Serial.print(acc_bias_world_y, 2);
+    Serial.print(F(" z="));              Serial.println(acc_bias_world_z, 2);
+    Serial.print(F("# ZUPT acc_off<")); Serial.print(tol_acc_offset, 4);
+    Serial.print(F(" acc_std<"));       Serial.print(tol_acc_std, 4);
+    Serial.print(F(" gyro<"));          Serial.println(tol_gyro, 3);
+#endif
+}
+
+/* ---------------- setup / loop -------------------------------------- */
+
+void setup()
+{
+    Serial.begin(SERIAL_BAUD);
+    delay(400);                 // let the bootloader chatter clear
+
+    Wire.begin();
+    Wire.setClock(I2C_CLOCK_HZ);
+    delay(100);
+
+    byte td = 1;
+    bool td_ok = iic_read(0x02, &td, 1);
+    if (td_ok) {
+        switch (td) {
+            case 0: delay_t = 100; break;
+            case 1: delay_t = 20;  break;
+            case 2: delay_t = 10;  break;
+            case 3: delay_t = 5;   break;
+            default: delay_t = 20; break;
+        }
+    } else {
+        delay_t = 20;
+#if VERBOSE_STARTUP
+        Serial.println(F("# WARNING: first I2C read failed. Check SDA/SCL/power/address."));
+#endif
+    }
+    delay(delay_t);
+
+    /* OPTIONAL_SET_ACC_RANGE
+     * +/-4g gives 4x finer resolution, which directly improves double
+     * integration. Hand motion never exceeds 4g. Verify the register
+     * layout against YOUR datasheet first, then set ACC_RANGE_G to 4.0f.
+     *
+     *   iic_write(0x07, 0x01);   // bits[1:0] = 01 -> +/-4g
+     *   delay(50);
+     */
+
+    attachInterrupt(digitalPinToInterrupt(2), Exti, RISING);
+
+    kalmanInit(&kf_acc_x,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_acc_y,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_acc_z,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_gyro_x, 0.05f, 0.5f,  10.0f);
+    kalmanInit(&kf_gyro_y, 0.05f, 0.5f,  10.0f);
+    kalmanInit(&kf_gyro_z, 0.05f, 0.5f,  10.0f);
+
+    posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
+    posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
+    posvelInit(&kf_pos_z, 0.0f, 0.0f, 1.0f, 1.0f);
+
+    last_sample_ms = millis();
+    calibrate();
+
+    last_update_us = micros();
+    last_print_ms  = millis();
+    last_diag_ms   = millis();
+}
+
+void loop()
+{
+    serviceDiagnostics();
+
+    if (!sampleReady()) return;
+    if (!readIMU())     return;   // bad read: do not integrate garbage
+
+    unsigned long now_us = micros();
+    float dt = (now_us - last_update_us) / 1000000.0f;
+    last_update_us = now_us;
+    if (dt <= 0.0f || dt > 0.25f) dt = delay_t / 1000.0f;
+
+    /* --- raw conversions --- */
+    float acc_x_g = my_95Q.acc_x * ACC_SCALE;
+    float acc_y_g = my_95Q.acc_y * ACC_SCALE;
+    float acc_z_g = my_95Q.acc_z * ACC_SCALE;
+
+    float gyro_x_dps = my_95Q.gyro_x * GYRO_SCALE;
+    float gyro_y_dps = my_95Q.gyro_y * GYRO_SCALE;
+    float gyro_z_dps = my_95Q.gyro_z * GYRO_SCALE;
+
+    /* --- display channel: smoothed, body frame --- */
+    float acc_x_mms2 = kalmanUpdate(&kf_acc_x, acc_x_g) * ACC_G_TO_MMS2;
+    float acc_y_mms2 = kalmanUpdate(&kf_acc_y, acc_y_g) * ACC_G_TO_MMS2;
+    float acc_z_mms2 = kalmanUpdate(&kf_acc_z, acc_z_g) * ACC_G_TO_MMS2;
+
+    float gyro_x_filt = kalmanUpdate(&kf_gyro_x, gyro_x_dps);
+    float gyro_y_filt = kalmanUpdate(&kf_gyro_y, gyro_y_dps);
+    float gyro_z_filt = kalmanUpdate(&kf_gyro_z, gyro_z_dps);
+
+    /* --- navigation channel: raw accel to world frame, gravity removed ---
+     * Raw rather than display-smoothed on purpose: the posvel filter has
+     * its own noise model tuned against raw input variance. */
+    float wx_g, wy_g, wz_g;
+    rotateBodyToWorld(acc_x_g, acc_y_g, acc_z_g,
+                      my_95Q.roll  / 100.0f,
+                      my_95Q.pitch / 100.0f,
+                      referencedYaw(),
+                      &wx_g, &wy_g, &wz_g);
+
+    // Residual BEFORE bias removal; this is what bias converges to at rest.
+    float res_x = wx_g * ACC_G_TO_MMS2;
+    float res_y = wy_g * ACC_G_TO_MMS2;
+    float res_z = (wz_g - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
+
+    float world_ax = res_x - acc_bias_world_x;
+    float world_ay = res_y - acc_bias_world_y;
+    float world_az = res_z - acc_bias_world_z;
+
+    /* --- stationary test over a sliding window --- */
+    float acc_mag_g  = sqrt(acc_x_g*acc_x_g + acc_y_g*acc_y_g + acc_z_g*acc_z_g);
+    float gyro_mag_d = sqrt(gyro_x_dps*gyro_x_dps + gyro_y_dps*gyro_y_dps + gyro_z_dps*gyro_z_dps);
+    statPush(acc_mag_g, gyro_mag_d);
+
+    // Raw condition, then the persistence gate. Coasting through a move
+    // trips the raw condition briefly; only sustained stillness passes.
+    bool stat_raw = statIsStationary();
+    if (!stat_raw) {
+        stationary_since_ms = 0;
+    } else if (stationary_since_ms == 0) {
+        stationary_since_ms = millis();
+    }
+    bool is_stationary = stat_raw
+                      && (millis() - stationary_since_ms >= STAT_HOLD_MS);
+
+    /* --- predict --- */
+    posvelPredict(&kf_pos_x, world_ax, dt, Q_ACCEL_VAR);
+    posvelPredict(&kf_pos_y, world_ay, dt, Q_ACCEL_VAR);
+    posvelPredict(&kf_pos_z, world_az, dt, Q_ACCEL_VAR);
+
+    if (is_stationary) {
+        posvelZUPT(&kf_pos_x, 1.0f);
+        posvelZUPT(&kf_pos_y, 1.0f);
+        posvelZUPT(&kf_pos_z, 1.0f);
+
+        acc_bias_world_x += BIAS_TRACK_A * (res_x - acc_bias_world_x);
+        acc_bias_world_y += BIAS_TRACK_A * (res_y - acc_bias_world_y);
+        acc_bias_world_z += BIAS_TRACK_A * (res_z - acc_bias_world_z);
+    } else if (VEL_TAU_S > 0.0f) {
+        float leak = exp(-dt / VEL_TAU_S);
+        posvelLeak(&kf_pos_x, leak);
+        posvelLeak(&kf_pos_y, leak);
+        posvelLeak(&kf_pos_z, leak);
+    }
+
+    /* --- throttled output --- */
+    unsigned long now_ms = millis();
+    if (now_ms - last_print_ms < (unsigned long)(1000 / PRINT_HZ)) return;
+    last_print_ms = now_ms;
+
+    Serial.print(F("acc_x: "));  Serial.print(acc_x_mms2, 1);
+    Serial.print(F(",acc_y: ")); Serial.print(acc_y_mms2, 1);
+    Serial.print(F(",acc_z: ")); Serial.print(acc_z_mms2, 1);
+
+    Serial.print(F(",gyro_x: ")); Serial.print(gyro_x_filt, 2);
+    Serial.print(F(",gyro_y: ")); Serial.print(gyro_y_filt, 2);
+    Serial.print(F(",gyro_z: ")); Serial.print(gyro_z_filt, 2);
+
+#if SEND_MAG
+    Serial.print(F(",mag_x: ")); Serial.print(my_95Q.mag_x);
+    Serial.print(F(",mag_y: ")); Serial.print(my_95Q.mag_y);
+    Serial.print(F(",mag_z: ")); Serial.print(my_95Q.mag_z);
+#endif
+
+    Serial.print(F(",roll: "));  Serial.print(my_95Q.roll  / 100.0, 2);
+    Serial.print(F(",pitch: ")); Serial.print(my_95Q.pitch / 100.0, 2);
+    Serial.print(F(",yaw: "));   Serial.print(my_95Q.yaw   / 100.0, 2);
+
+#if SEND_WORLD_ACC
+    Serial.print(F(",wacc_x: ")); Serial.print(world_ax, 1);
+    Serial.print(F(",wacc_y: ")); Serial.print(world_ay, 1);
+    Serial.print(F(",wacc_z: ")); Serial.print(world_az, 1);
+#endif
+
+    Serial.print(F(",temp: "));  Serial.print(my_95Q.temp / 100.0, 2);
+    Serial.print(F(",leve: "));  Serial.print(my_95Q.leve);
+
+    Serial.print(F(",pos_x_mm: ")); Serial.print(kf_pos_x.pos, 1);
+    Serial.print(F(",pos_y_mm: ")); Serial.print(kf_pos_y.pos, 1);
+    Serial.print(F(",pos_z_mm: ")); Serial.print(kf_pos_z.pos, 1);
+
+#if SEND_VEL
+    Serial.print(F(",vel_x_mms: ")); Serial.print(kf_pos_x.vel, 1);
+    Serial.print(F(",vel_y_mms: ")); Serial.print(kf_pos_y.vel, 1);
+    Serial.print(F(",vel_z_mms: ")); Serial.print(kf_pos_z.vel, 1);
+#endif
+
+    Serial.print(F(",stationary: ")); Serial.println(is_stationary ? 1 : 0);
+}
+
+/* ---------------- low level ----------------------------------------- */
+
+void Exti()
+{
+    ready_Ok = 1;
+    int_count++;
+}
+
+bool iic_read(unsigned char add, unsigned char *data, unsigned char len)
+{
+    Wire.beginTransmission(iic_add);
+    Wire.write(add);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    byte received = Wire.requestFrom(iic_add, (int)len);
+    if (received != len) return false;
+
+    for (byte j = 0; j < len; j++) *data++ = Wire.read();
+    return true;
+}
+
+void iic_write(char add, unsigned char data)
+{
+    Wire.beginTransmission(iic_add);
+    Wire.write((uint8_t)add);
+    Wire.write((uint8_t)data);
+    Wire.endTransmission();
+}
