@@ -54,7 +54,18 @@
 #define SENSOR2_SHUT_PIN  5
 #define SENSOR2_ADDRESS   0x30     // any free 7-bit address that is not 0x29
 #define RANGE_PERIOD_MS   50       // continuous-mode period, multiple of 10
-#define RANGE_MAX_VALID   200      // mm; beyond this the VL6180X is guessing
+
+// VL6180X range scaling. The part is designed for short range and this is
+// the lever that trades resolution for reach:
+//   1 -> 1 mm resolution, usable to roughly 200 mm  (default)
+//   2 -> 2 mm resolution, usable to roughly 400 mm
+//   3 -> 3 mm resolution, usable to roughly 600 mm
+// Scaling 1 gives the best correction quality but means the needle has to
+// stay within ~20 cm of the target or the correction simply stops. If you
+// keep losing lock because you work further out, try 2. Update
+// RANGE_MEAS_VAR below if you do - coarser scaling is noisier.
+#define RANGE_SCALING     1
+#define RANGE_MAX_VALID   (200 * RANGE_SCALING)   // mm
 
 /* --- IMU scaling --- */
 #define ACC_RANGE_G     16.0f
@@ -96,12 +107,26 @@
  * closest to parallel with, and only when that alignment is better than
  * BEAM_ALIGN_MIN. Off-axis geometry is left to the IMU.
  * ------------------------------------------------------------------- */
-#define USE_RANGE_CORRECTION 0
+#define USE_RANGE_CORRECTION 1
 #define RANGE_MEAS_VAR    36.0f    // (mm)^2; VL6180X is roughly +/-5 mm
-#define BEAM_ALIGN_MIN    0.90f    // |cos| between beam and the world axis
+
+// Reject any correction that disagrees with the current estimate by more
+// than this. Sweeping off the edge of the target produces a sudden step
+// of tens of mm - without this gate that step gets believed and yanks
+// position with it.
+#define RANGE_INNOV_MAX   40.0f    // mm
+#define RANGE_REJECT_MAX  15       // consecutive rejects before re-anchoring
+#define RANGE_STABLE_MM   3.0f     // reading must be this steady to anchor
+
+// How long the reading must stay steady before anchoring. Anchoring no
+// longer waits for ZUPT: if the stationary detector never fires, the old
+// code would never anchor, so the correction silently never ran.
+#define RANGE_ANCHOR_MS   800UL
 
 // Beam direction in the BODY frame. Your Slicer script mounts the probes
-// along local +Z (out past the needle), so this matches it.
+// along local +Z (out past the needle), so this matches it. The
+// correction now works at ANY orientation, not just when the beam is
+// close to a world axis, so there is no alignment threshold any more.
 #define BEAM_BODY_X  0.0f
 #define BEAM_BODY_Y  0.0f
 #define BEAM_BODY_Z  1.0f
@@ -315,8 +340,19 @@ unsigned long stationary_since_ms = 0;
 // Range-correction anchor: the range reading captured when the surface
 // reference was established, and which axis it is being applied to.
 bool  range_anchored = false;
-float range_anchor_mm = 0.0f;
-int8_t range_axis = -1;          // 0=x, 1=y, 2=z, -1 = not correcting
+float range_anchor_C = 0.0f;     // (position along beam + range) at anchor
+float last_range_mm = -1.0f;
+float range_innov = 0.0f;        // measurement minus estimate, mm
+uint8_t range_reject_count = 0;
+uint8_t range_lock = 0;          // 1 while the range is actively correcting
+unsigned long range_stable_since_ms = 0;
+
+// Why the correction is or is not running, published to Slicer:
+//   0 no usable reading - nothing within range of the beam
+//   1 waiting for a steady reading before anchoring
+//   2 locked and correcting
+//   3 reading rejected as an outlier (edge crossing, or target moved)
+uint8_t range_state = 0;
 
 float referencedYaw()
 {
@@ -401,6 +437,7 @@ void setupRangeSensors()
     sensor2.setTimeout(200);
     sensor2.init();
     sensor2.configureDefault();
+    sensor2.setScaling(RANGE_SCALING);
     sensor2.setAddress(SENSOR2_ADDRESS);
     sensor2_present = !sensor2.timeoutOccurred();
 
@@ -409,6 +446,7 @@ void setupRangeSensors()
     sensor1.setTimeout(200);
     sensor1.init();
     sensor1.configureDefault();
+    sensor1.setScaling(RANGE_SCALING);
     sensor1_present = !sensor1.timeoutOccurred();
 
     // Continuous mode: the sensors range on their own schedule and we
@@ -430,55 +468,104 @@ void setupRangeSensors()
 /* ---------------- Range-aided position correction ------------------- */
 
 #if USE_RANGE_CORRECTION
+
+// Correct one axis given the beam's component along it. This is the
+// standard Kalman update for a measurement of a PROJECTION of position,
+// H = [ux 0 uy 0 uz 0], split across three independent per-axis filters.
+// A single joint 6-state filter would also build cross-axis covariance;
+// we ignore that, which is the usual pragmatic simplification and costs
+// little when the beam is close to one axis.
+void correctAxisAlongBeam(PosVelKF *kf, float u, float innov, float S)
+{
+    if (u == 0.0f || S <= 0.0f) return;
+
+    float K0 = kf->P[0][0] * u / S;
+    float K1 = kf->P[1][0] * u / S;
+
+    kf->pos += K0 * innov;
+    kf->vel += K1 * innov;      // correcting position corrects velocity too
+
+    float HP0 = u * kf->P[0][0];
+    float HP1 = u * kf->P[0][1];
+    kf->P[0][0] -= K0 * HP0;
+    kf->P[0][1] -= K0 * HP1;
+    kf->P[1][0] -= K1 * HP0;
+    kf->P[1][1] -= K1 * HP1;
+}
+
 void applyRangeCorrection(bool is_stationary)
 {
-    // Prefer the average of both sensors when both are usable: same beam
-    // direction, so averaging halves the noise.
-    float d;
-    if (dist1_mm >= 0.0f && dist2_mm >= 0.0f)      d = 0.5f * (dist1_mm + dist2_mm);
-    else if (dist1_mm >= 0.0f)                     d = dist1_mm;
-    else if (dist2_mm >= 0.0f)                     d = dist2_mm;
-    else { range_axis = -1; return; }
+    (void)is_stationary;
+    range_lock = 0;
 
-    // Beam direction in world coordinates.
+    float d;
+    if (dist1_mm >= 0.0f && dist2_mm >= 0.0f) d = 0.5f * (dist1_mm + dist2_mm);
+    else if (dist1_mm >= 0.0f)                d = dist1_mm;
+    else if (dist2_mm >= 0.0f)                d = dist2_mm;
+    else {
+        range_state = 0;                 // nothing in front of the beam
+        range_anchored = false;
+        range_stable_since_ms = 0;
+        return;
+    }
+
     float ux, uy, uz;
     rotateBodyToWorld(BEAM_BODY_X, BEAM_BODY_Y, BEAM_BODY_Z,
                       my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
                       referencedYaw(), &ux, &uy, &uz);
 
-    // Which world axis is the beam closest to parallel with?
-    float ax = fabs(ux), ay = fabs(uy), az = fabs(uz);
-    int8_t axis; float comp;
-    if (ax >= ay && ax >= az)      { axis = 0; comp = ux; }
-    else if (ay >= az)             { axis = 1; comp = uy; }
-    else                           { axis = 2; comp = uz; }
+    float p_along = kf_pos_x.pos * ux + kf_pos_y.pos * uy + kf_pos_z.pos * uz;
 
-    if (fabs(comp) < BEAM_ALIGN_MIN) { range_axis = -1; return; }
-
-    // Establish the surface reference the first time we are both still
-    // and looking at something.
     if (!range_anchored) {
-        if (!is_stationary) { range_axis = -1; return; }
-        range_anchor_mm = d;
+        // Anchor as soon as the reading holds steady, whether or not the
+        // stationary detector agrees. Requiring ZUPT here meant a fussy
+        // threshold could stop the correction from ever starting.
+        if (last_range_mm < 0.0f || fabs(d - last_range_mm) > RANGE_STABLE_MM) {
+            range_stable_since_ms = 0;
+        } else if (range_stable_since_ms == 0) {
+            range_stable_since_ms = millis();
+        }
+        last_range_mm = d;
+
+        if (range_stable_since_ms == 0
+            || millis() - range_stable_since_ms < RANGE_ANCHOR_MS) {
+            range_state = 1;
+            return;
+        }
+
+        range_anchor_C = p_along + d;
         range_anchored = true;
+        range_reject_count = 0;
 #if VERBOSE_STARTUP
-        Serial.print(F("# Range anchor set at ")); Serial.print(d, 1); Serial.println(F(" mm"));
+        Serial.print(F("# Range anchored at ")); Serial.print(d, 1); Serial.println(F(" mm"));
 #endif
     }
+    last_range_mm = d;
 
-    // Surface is fixed, so (position along beam) + (range) is constant.
-    // Closing on the surface by 10 mm means we moved 10 mm along +beam.
-    float z_pos = (range_anchor_mm - d) / comp;
+    range_innov = (range_anchor_C - d) - p_along;
 
-    // Noise grows as the beam tilts away from the axis.
-    float meas_var = RANGE_MEAS_VAR / (comp * comp);
+    if (fabs(range_innov) > RANGE_INNOV_MAX) {
+        range_state = 3;
+        if (++range_reject_count > RANGE_REJECT_MAX) {
+            range_anchor_C = p_along + d;
+            range_reject_count = 0;
+        }
+        return;
+    }
+    range_reject_count = 0;
 
-    range_axis = axis;
-    if (axis == 0)      posvelCorrect(&kf_pos_x, z_pos, meas_var);
-    else if (axis == 1) posvelCorrect(&kf_pos_y, z_pos, meas_var);
-    else                posvelCorrect(&kf_pos_z, z_pos, meas_var);
+    float S = ux * ux * kf_pos_x.P[0][0]
+            + uy * uy * kf_pos_y.P[0][0]
+            + uz * uz * kf_pos_z.P[0][0]
+            + RANGE_MEAS_VAR;
+
+    correctAxisAlongBeam(&kf_pos_x, ux, range_innov, S);
+    correctAxisAlongBeam(&kf_pos_y, uy, range_innov, S);
+    correctAxisAlongBeam(&kf_pos_z, uz, range_innov, S);
+    range_state = 2;
+    range_lock = 1;
 }
-#endif
+#endif  // USE_RANGE_CORRECTION
 
 /* ---------------- Sample acquisition -------------------------------- */
 
@@ -505,6 +592,32 @@ bool readIMU()
     last_sample_ms = millis();
     sample_count++;
     return true;
+}
+
+// Single-character commands, typed into the Serial Monitor:
+//   a = drop the anchor and re-establish it here
+//   z = zero position and velocity
+void serviceSerialCommands()
+{
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'a' || c == 'A') {
+            range_anchored = false;
+            range_stable_since_ms = 0;
+            last_range_mm = -1.0f;
+#if VERBOSE_STARTUP
+            Serial.println(F("# Re-anchoring range reference..."));
+#endif
+        } else if (c == 'z' || c == 'Z') {
+            posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
+            posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
+            posvelInit(&kf_pos_z, 0.0f, 0.0f, 1.0f, 1.0f);
+            range_anchored = false;
+#if VERBOSE_STARTUP
+            Serial.println(F("# Position zeroed."));
+#endif
+        }
+    }
 }
 
 void serviceDiagnostics()
@@ -664,6 +777,7 @@ void setup()
 
 void loop()
 {
+    serviceSerialCommands();
     serviceDiagnostics();
     serviceRangeSensors();       // non-blocking; takes whatever is ready
 
@@ -787,7 +901,9 @@ void loop()
     Serial.print(F(",vel_z_mms: ")); Serial.print(kf_pos_z.vel, 1);
 #endif
 
-    Serial.print(F(",range_axis: ")); Serial.print(range_axis);
+    Serial.print(F(",range_state: ")); Serial.print(range_state);
+    Serial.print(F(",range_lock: "));  Serial.print(range_lock);
+    Serial.print(F(",range_innov: ")); Serial.print(range_innov, 1);
     Serial.print(F(",stationary: ")); Serial.println(is_stationary ? 1 : 0);
 }
 
