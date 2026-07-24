@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jul 24 10:20:45 2026
+
+@author: mariofleury
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GY-95T -> 3D Slicer live view: needle orientation + dead-reckoned position.
+
+CRASH-HARDENED VERSION. Changes vs. the previous script, all aimed at
+keeping Slicer alive:
+
+ 1. NOTHING HEAVY RUNS INSIDE THE MRML OBSERVER. The observer now only
+    copies the incoming string into a variable and returns. All VTK work
+    (transform, trail, annotation, render) happens in a QTimer on the main
+    event loop. Rendering from inside an observer callback is the classic
+    way to segfault Slicer: forceRender() pumps the Qt event loop, which
+    can re-enter the same callback, which renders again, and the stack
+    unwinds into a crash.
+
+ 2. scheduleRender() INSTEAD OF forceRender(). scheduleRender coalesces
+    requests and lets Slicer render when it is safe to do so. forceRender
+    renders immediately, including while polydata is mid-update.
+
+ 3. STALE OBSERVERS ARE CLEANED UP. Every time you pasted the old script,
+    it added another observer to the same node and orphaned the previous
+    controller, which kept firing forever with no way to stop it. Ten
+    pastes meant ten callbacks and ten renders per sample. The bottom of
+    this file now stops any previous controller first.
+
+ 4. NOTHING THROWS INTO VTK. A Python exception propagating out of a VTK
+    callback is undefined behaviour and takes the application down in some
+    builds. Every callback body is wrapped, and after MAX_ERRORS
+    consecutive failures the controller detaches itself instead of
+    crash-looping.
+
+ 5. Works whether ArduinoConnect exposes data via GetParameter("Data")
+    (vtkMRMLScriptedModuleNode) or GetText() (vtkMRMLTextNode).
+
+If it still crashes with SAFE_MODE = True, the problem is not in this
+file - see the triage note at the bottom.
+
+@author: mariofleury
+"""
+
+import time
+import numpy as np
+import vtk
+import qt
+import slicer
+
+# ---------------------------------------------------------------- nodes
+ARDUINO_NODE_NAME   = "arduinoNode"     # rename if yours differs
+TRANSFORM_NODE_NAME = "GY95TTransform"
+STL_NODE_NAME       = "Syringe_fc"
+STL_FILE_PATH       = None              # fallback path, if not already loaded
+FLOOR_NODE_NAME     = "FloorGrid"
+AXES_NODE_NAME      = "WorldAxes"
+TRAIL_NODE_NAME     = "NeedleTrail"
+
+# ----------------------------------------------------------- safe mode
+# True  -> no trail, no floor grid, no axes, no annotation. Just the
+#          syringe moving. Use this to prove the pipeline is stable, then
+#          switch back to False.
+SAFE_MODE = False
+
+UPDATE_INTERVAL_MS = 50      # timer period: 20 UI updates/s
+MAX_ERRORS         = 10      # consecutive failures before self-detaching
+
+# ------------------------------------------------------------- geometry
+MOUNT_ROTATION = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0],
+])
+
+STL_Z_MIN = 0.0
+STL_Z_MAX = 147.6
+PIVOT_TIP    = (0.0, 0.0, STL_Z_MAX)
+PIVOT_CENTER = (0.0, 0.0, (STL_Z_MIN + STL_Z_MAX) / 2.0)
+PIVOT_LOCAL_POS = PIVOT_CENTER
+TIP_LOCAL_POS   = PIVOT_TIP
+
+# ------------------------------------------------------------ viewport
+POS_X_RANGE = (-250.0, 250.0)
+POS_Y_RANGE = (-200.0, 200.0)
+POS_Z_RANGE = (-100.0, 1000.0)
+
+# --------------------------------------------------------------- trail
+SHOW_TRAIL        = True
+TRAIL_MAX_POINTS  = 1500
+TRAIL_MIN_STEP_MM = 0.5
+TRAIL_COLOR       = (1.0, 0.45, 0.1)
+
+# ---------------------------------------------------------- range probes
+SHOW_PROBES     = True
+PROBE1_NODE_NAME = "VL6180XProbe1"
+PROBE2_NODE_NAME = "VL6180XProbe2"
+
+# Where each sensor sits and which way it looks, in the model's LOCAL
+# frame (mm). The STL runs from Z=0 at the plunger to Z~147.6 at the tip,
+# so these sit just behind the tip looking out past the needle. Adjust to
+# match how they are actually glued on.
+SENSOR1_LOCAL_POS = (3.0, 0.0, 145.0)
+SENSOR1_LOCAL_DIR = (0.0, 0.0, 1.0)
+SENSOR2_LOCAL_POS = (-3.0, 0.0, 145.0)
+SENSOR2_LOCAL_DIR = (0.0, 0.0, 1.0)
+
+PROBE_MAX_MM    = 250.0
+PROBE_RADIUS_MM = 1.0
+PROBE_NEAR_MM   = 50.0     # red below this
+PROBE_MID_MM    = 150.0    # yellow below this, green above
+
+# ----------------------------------------------------------------- box
+BOX_FONT_MAX = 18
+BOX_COMPACT  = False    # True = the five-line layout only
+
+
+def parse_line(raw):
+    """Parse 'key: value, key: value, ...' into a dict of floats.
+
+    The serial stream can arrive concatenated or truncated, so scan every
+    line and keep the last complete one."""
+    best = {}
+    for line in str(raw).replace("\r", "\n").split("\n"):
+        data = {}
+        for token in line.split(","):
+            if ":" not in token:
+                continue
+            key, val = token.split(":", 1)
+            try:
+                data[key.strip()] = float(val.strip())
+            except ValueError:
+                pass
+        if all(k in data for k in ("roll", "pitch", "yaw")):
+            best = data
+    return best
+
+
+def euler_to_rotation_matrix(roll_deg, pitch_deg, yaw_deg):
+    r, p, y = np.radians([roll_deg, pitch_deg, yaw_deg])
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(r), -np.sin(r)],
+                   [0, np.sin(r),  np.cos(r)]])
+    Ry = np.array([[ np.cos(p), 0, np.sin(p)],
+                   [0, 1, 0],
+                   [-np.sin(p), 0, np.cos(p)]])
+    Rz = np.array([[np.cos(y), -np.sin(y), 0],
+                   [np.sin(y),  np.cos(y), 0],
+                   [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def read_arduino_payload(node):
+    """ArduinoConnect exposes its data differently across versions."""
+    if hasattr(node, "GetParameter"):
+        try:
+            val = node.GetParameter("Data")
+            if val:
+                return val
+        except Exception:
+            pass
+    if hasattr(node, "GetText"):
+        try:
+            return node.GetText()
+        except Exception:
+            pass
+    if hasattr(node, "GetAttribute"):
+        try:
+            return node.GetAttribute("Data")
+        except Exception:
+            pass
+    return None
+
+
+def get_or_create_transform(name):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None:
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        print(f"Created transform node '{name}'.")
+    return node
+
+
+def get_or_load_syringe(name, file_path, transform_node):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None and file_path:
+        print(f"Node '{name}' not found; loading from '{file_path}'...")
+        node = slicer.util.loadModel(file_path)
+        if node is not None:
+            node.SetName(name)
+    if node is None:
+        raise RuntimeError(
+            f"No model node named '{name}' in the scene and no STL_FILE_PATH "
+            "given. Load Syringe_fc.stl (File > Add Data) or set STL_FILE_PATH."
+        )
+    node.SetAndObserveTransformNodeID(transform_node.GetID())
+    return node
+
+
+def create_floor_grid(name=FLOOR_NODE_NAME):
+    existing = slicer.mrmlScene.GetFirstNodeByName(name)
+    if existing is not None:
+        return existing
+
+    src = vtk.vtkPlaneSource()
+    src.SetOrigin(POS_X_RANGE[0], POS_Y_RANGE[0], 0)
+    src.SetPoint1(POS_X_RANGE[1], POS_Y_RANGE[0], 0)
+    src.SetPoint2(POS_X_RANGE[0], POS_Y_RANGE[1], 0)
+    src.SetXResolution(20)
+    src.SetYResolution(20)
+    src.Update()
+
+    node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+    node.SetAndObservePolyData(src.GetOutput())
+    node.CreateDefaultDisplayNodes()
+    d = node.GetDisplayNode()
+    d.SetRepresentation(1)
+    d.SetColor(0.2, 0.8, 0.2)
+    d.SetLineWidth(1)
+    d.SetOpacity(0.5)
+    d.SetLighting(False)
+    return node
+
+
+def create_world_axes(name=AXES_NODE_NAME, length=80.0):
+    existing = slicer.mrmlScene.GetFirstNodeByName(name)
+    if existing is not None:
+        return existing
+
+    pts = vtk.vtkPoints()
+    lines = vtk.vtkCellArray()
+    pts.InsertNextPoint(0, 0, 0)
+    for axis in range(3):
+        end = [0.0, 0.0, 0.0]
+        end[axis] = length
+        pid = pts.InsertNextPoint(end)
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, 0)
+        line.GetPointIds().SetId(1, pid)
+        lines.InsertNextCell(line)
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(pts)
+    poly.SetLines(lines)
+
+    node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+    node.SetAndObservePolyData(poly)
+    node.CreateDefaultDisplayNodes()
+    d = node.GetDisplayNode()
+    d.SetColor(0.9, 0.9, 0.9)
+    d.SetLineWidth(3)
+    d.SetLighting(False)
+    return node
+
+
+class NeedleTrail:
+    """Growing polyline of tip positions. Only ever touched from the timer,
+    never from the MRML observer, so it is never modified mid-render."""
+
+    def __init__(self, name=TRAIL_NODE_NAME):
+        self.points = vtk.vtkPoints()
+        self.lines = vtk.vtkCellArray()
+        self.poly = vtk.vtkPolyData()
+        self.poly.SetPoints(self.points)
+        self.poly.SetLines(self.lines)
+
+        node = slicer.mrmlScene.GetFirstNodeByName(name)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObservePolyData(self.poly)
+        node.CreateDefaultDisplayNodes()
+        d = node.GetDisplayNode()
+        d.SetColor(*TRAIL_COLOR)
+        d.SetLineWidth(3)
+        d.SetLighting(False)
+        self.node = node
+        self.last = None
+
+    def add(self, p):
+        if self.last is not None and np.linalg.norm(p - self.last) < TRAIL_MIN_STEP_MM:
+            return
+        if self.points.GetNumberOfPoints() >= TRAIL_MAX_POINTS:
+            self.clear()
+        pid = self.points.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+        if pid > 0:
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, pid - 1)
+            line.GetPointIds().SetId(1, pid)
+            self.lines.InsertNextCell(line)
+            self.lines.Modified()
+        self.points.Modified()
+        self.poly.Modified()
+        self.last = p.copy()
+
+    def clear(self):
+        self.points.Reset()
+        self.lines.Reset()
+        self.points.Modified()
+        self.lines.Modified()
+        self.poly.Modified()
+        self.last = None
+
+    def setVisible(self, visible):
+        self.node.GetDisplayNode().SetVisibility(bool(visible))
+
+
+class RangeProbe:
+    """A tube from the sensor position out along its beam, its length set
+    by the live range reading and its colour by proximity.
+
+    The VTK pipeline lives on this object rather than as attributes stuck
+    onto the MRML node - node attributes vanish between script runs and
+    the old code had to rebuild them defensively."""
+
+    def __init__(self, name, local_pos, local_dir, transform_node):
+        self.origin = np.array(local_pos, dtype=float)
+        d = np.array(local_dir, dtype=float)
+        n = np.linalg.norm(d)
+        self.dir = d / n if n > 0 else np.array([0.0, 0.0, 1.0])
+
+        self.line = vtk.vtkLineSource()
+        self.line.SetPoint1(*self.origin)
+        self.line.SetPoint2(*(self.origin + self.dir * PROBE_RADIUS_MM))
+
+        self.tube = vtk.vtkTubeFilter()
+        self.tube.SetInputConnection(self.line.GetOutputPort())
+        self.tube.SetRadius(PROBE_RADIUS_MM)
+        self.tube.SetNumberOfSides(12)
+        self.tube.CappingOn()
+        self.tube.Update()
+
+        node = slicer.mrmlScene.GetFirstNodeByName(name)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObservePolyData(self.tube.GetOutput())
+        node.CreateDefaultDisplayNodes()
+        node.GetDisplayNode().SetColor(0.2, 1.0, 0.2)
+        node.SetAndObserveTransformNodeID(transform_node.GetID())
+        self.node = node
+        self.lastValid = None
+
+    def update(self, distance_mm):
+        """distance_mm < 0 means the sensor reported nothing usable."""
+        display = self.node.GetDisplayNode()
+
+        if distance_mm is None or distance_mm < 0:
+            # Out of range or bad read: draw it dim and full length so it
+            # is obvious the beam is seeing nothing rather than seeing zero.
+            self._setLength(PROBE_MAX_MM)
+            display.SetColor(0.45, 0.45, 0.45)
+            display.SetOpacity(0.35)
+            return
+
+        d = max(0.0, min(float(distance_mm), PROBE_MAX_MM))
+        self._setLength(max(d, 0.01))
+        display.SetOpacity(1.0)
+
+        if d < PROBE_NEAR_MM:
+            display.SetColor(1.0, 0.2, 0.2)
+        elif d < PROBE_MID_MM:
+            display.SetColor(1.0, 0.85, 0.2)
+        else:
+            display.SetColor(0.2, 1.0, 0.2)
+        self.lastValid = d
+
+    def _setLength(self, length):
+        self.line.SetPoint2(*(self.origin + self.dir * length))
+        self.line.Update()
+        self.tube.Update()
+        self.node.SetAndObservePolyData(self.tube.GetOutput())
+
+    def setVisible(self, visible):
+        self.node.GetDisplayNode().SetVisibility(bool(visible))
+
+
+class GY95TController:
+
+    def __init__(self, arduino_node_name=ARDUINO_NODE_NAME):
+        self.arduinoNode = slicer.mrmlScene.GetFirstNodeByName(arduino_node_name)
+        if self.arduinoNode is None:
+            raise RuntimeError(
+                f"Could not find node '{arduino_node_name}'. Connect "
+                "ArduinoConnect first."
+            )
+
+        self.transformNode = get_or_create_transform(TRANSFORM_NODE_NAME)
+        self.syringeNode = get_or_load_syringe(STL_NODE_NAME, STL_FILE_PATH, self.transformNode)
+
+        self.floorNode = None
+        self.axesNode = None
+        self.trail = None
+        self.probe1 = None
+        self.probe2 = None
+        if not SAFE_MODE:
+            self.floorNode = create_floor_grid()
+            self.axesNode = create_world_axes()
+            self.trail = NeedleTrail()
+            self.trail.setVisible(SHOW_TRAIL)
+            self.probe1 = RangeProbe(PROBE1_NODE_NAME, SENSOR1_LOCAL_POS,
+                                     SENSOR1_LOCAL_DIR, self.transformNode)
+            self.probe2 = RangeProbe(PROBE2_NODE_NAME, SENSOR2_LOCAL_POS,
+                                     SENSOR2_LOCAL_DIR, self.transformNode)
+            self.probe1.setVisible(SHOW_PROBES)
+            self.probe2.setVisible(SHOW_PROBES)
+
+        self.matrix = vtk.vtkMatrix4x4()
+        self.pivot = np.array(PIVOT_LOCAL_POS, dtype=float)
+        self.tipLocal = np.array(TIP_LOCAL_POS, dtype=float)
+
+        self.rawPosition = np.zeros(3)
+        self.originOffset = np.zeros(3)
+        self.clamped = False
+        self._warnedNoPosition = False
+
+        self._pending = None        # written by observer, read by timer
+        self._busy = False          # reentrancy guard
+        self._errors = 0
+        self._samples = 0
+
+        self._applyTransform(np.eye(3), np.zeros(3))
+
+        layoutManager = slicer.app.layoutManager()
+        threeDWidget = layoutManager.threeDWidget(0)
+        self.threeDView = threeDWidget.threeDView()
+        threeDWidget.threeDController().resetFocalPoint()
+
+        if not SAFE_MODE:
+            ca = self.threeDView.cornerAnnotation()
+            ca.GetTextProperty().SetColor(1, 1, 1)
+            try:
+                ca.SetMaximumFontSize(BOX_FONT_MAX)
+            except AttributeError:
+                pass
+
+        # Observer: as close to a no-op as possible.
+        self.observerTag = self.arduinoNode.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self.onArduinoDataUpdated
+        )
+
+        # Timer: everything expensive happens here, on the main loop.
+        self.timer = qt.QTimer()
+        self.timer.setInterval(UPDATE_INTERVAL_MS)
+        self.timer.connect("timeout()", self._tick)
+        self.timer.start()
+
+        print(f"GY95TController running (SAFE_MODE={SAFE_MODE}). "
+              "Call controller.stop() before re-running this script.")
+
+    # ---------------------------------------------------------- observer
+    def onArduinoDataUpdated(self, caller, event):
+        """Copy and return. No VTK calls, no rendering, no exceptions."""
+        try:
+            self._pending = read_arduino_payload(self.arduinoNode)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- timer
+    def _tick(self):
+        if self._busy:
+            return
+        payload, self._pending = self._pending, None
+        if payload is None:
+            return
+
+        self._busy = True
+        try:
+            self._update(payload)
+            self._errors = 0
+        except Exception as exc:
+            self._errors += 1
+            print(f"GY95T update error ({self._errors}/{MAX_ERRORS}): {exc}")
+            if self._errors >= MAX_ERRORS:
+                print("Too many consecutive errors - detaching to protect Slicer.")
+                self.stop()
+        finally:
+            self._busy = False
+
+    def _update(self, payload):
+        data = parse_line(payload)
+        if not data:
+            return
+        self._samples += 1
+
+        R_live = euler_to_rotation_matrix(data["roll"], data["pitch"], data["yaw"])
+
+        if all(k in data for k in ("pos_x_mm", "pos_y_mm", "pos_z_mm")):
+            self.rawPosition = np.array([data["pos_x_mm"], data["pos_y_mm"], data["pos_z_mm"]])
+        elif not self._warnedNoPosition:
+            print("NOTE: no pos_x_mm/pos_y_mm/pos_z_mm in the stream - the model "
+                  "will rotate but stay parked.")
+            self._warnedNoPosition = True
+
+        position = self._clamp(self.rawPosition - self.originOffset)
+        R = self._applyTransform(R_live, position)
+
+        if self.trail is not None and SHOW_TRAIL:
+            tipWorld = R @ (self.tipLocal - self.pivot) + self.pivot + position
+            self.trail.add(tipWorld)
+
+        # Probes are parented to the same transform, so they inherit the
+        # syringe's pose for free; only their length and colour change.
+        if self.probe1 is not None and SHOW_PROBES:
+            self.probe1.update(data.get("distance_mm", -1.0))
+            self.probe2.update(data.get("distance_mm2", -1.0))
+
+        if not SAFE_MODE:
+            self._updateBox(data, position)
+
+        self.threeDView.scheduleRender()
+
+    # ------------------------------------------------------------- pose
+    def _applyTransform(self, R_live, position):
+        R = R_live @ MOUNT_ROTATION
+        translation = (self.pivot - R @ self.pivot) + position
+        for i in range(3):
+            for j in range(3):
+                self.matrix.SetElement(i, j, R[i, j])
+            self.matrix.SetElement(i, 3, translation[i])
+        self.transformNode.SetMatrixTransformToParent(self.matrix)
+        return R
+
+    def _clamp(self, p):
+        c = np.array([
+            min(max(p[0], POS_X_RANGE[0]), POS_X_RANGE[1]),
+            min(max(p[1], POS_Y_RANGE[0]), POS_Y_RANGE[1]),
+            min(max(p[2], POS_Z_RANGE[0]), POS_Z_RANGE[1]),
+        ])
+        self.clamped = bool(np.any(np.abs(c - p) > 1e-6))
+        return c
+
+    # -------------------------------------------------------------- box
+    def _updateBox(self, data, position):
+        flag = "  [CLAMPED]" if self.clamped else ""
+        lines = [
+            f"Roll: {data.get('roll', 0):.2f}  "
+            f"Pitch: {data.get('pitch', 0):.2f}  "
+            f"Yaw: {data.get('yaw', 0):.2f}",
+
+            f"Accel (mm/s^2)  X: {data.get('acc_x', 0):.0f}  "
+            f"Y: {data.get('acc_y', 0):.0f}  "
+            f"Z: {data.get('acc_z', 0):.0f}",
+
+            f"Gyro (deg/s)  X: {data.get('gyro_x', 0):.2f}  "
+            f"Y: {data.get('gyro_y', 0):.2f}  "
+            f"Z: {data.get('gyro_z', 0):.2f}",
+
+            f"Mag  X: {data.get('mag_x', 0):.0f}  "
+            f"Y: {data.get('mag_y', 0):.0f}  "
+            f"Z: {data.get('mag_z', 0):.0f}",
+
+            f"Position (mm)  X: {position[0]:.1f}  "
+            f"Y: {position[1]:.1f}  "
+            f"Z: {position[2]:.1f}{flag}",
+        ]
+        if not BOX_COMPACT:
+            lines += [
+                f"Temp: {data.get('temp', 0):.2f} C   "
+                f"Level: {data.get('leve', 0):.0f}",
+
+                f"Velocity (mm/s)  X: {data.get('vel_x_mms', 0):.1f}  "
+                f"Y: {data.get('vel_y_mms', 0):.1f}  "
+                f"Z: {data.get('vel_z_mms', 0):.1f}",
+
+                f"Range 1: {self._fmtRange(data.get('distance_mm', -1.0))}   "
+                f"Range 2: {self._fmtRange(data.get('distance_mm2', -1.0))}"
+                f"{self._fmtCorrection(data)}",
+
+                f"World accel (mm/s^2)  X: {data.get('wacc_x', 0):.0f}  "
+                f"Y: {data.get('wacc_y', 0):.0f}  "
+                f"Z: {data.get('wacc_z', 0):.0f}",
+
+                f"Stationary (ZUPT): {'YES' if data.get('stationary', 0) else 'no'}",
+            ]
+        self.threeDView.cornerAnnotation().SetText(2, "\n".join(lines))
+
+    @staticmethod
+    def _fmtRange(value):
+        return "--" if value is None or value < 0 else f"{value:.0f} mm"
+
+    @staticmethod
+    def _fmtCorrection(data):
+        axis = int(data.get("range_axis", -1))
+        if axis < 0:
+            return ""
+        return f"   correcting {'XYZ'[axis]}"
+
+    # --------------------------------------------------------- controls
+    def setProbes(self, visible):
+        if self.probe1 is not None:
+            self.probe1.setVisible(visible)
+            self.probe2.setVisible(visible)
+
+    def zeroPosition(self):
+        self.originOffset = self.rawPosition.copy()
+        self.clearTrail()
+        print("Position re-zeroed.")
+
+    def clearTrail(self):
+        if self.trail is not None:
+            self.trail.clear()
+
+    def setTrail(self, visible):
+        if self.trail is not None:
+            self.trail.setVisible(visible)
+
+    def stop(self):
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            self.arduinoNode.RemoveObserver(self.observerTag)
+        except Exception:
+            pass
+        print(f"GY95TController stopped after {self._samples} samples.")
+
+
+# --- Stop any controller left over from a previous paste, THEN start. ---
+_prev = globals().get("controller", None)
+if _prev is not None:
+    try:
+        _prev.stop()
+    except Exception:
+        pass
+
+controller = GY95TController()
+
+# controller.zeroPosition()
+# controller.stop()
