@@ -21,9 +21,9 @@
  *    Filters are now on acc x/y/z, gyro x/y/z, and both range channels
  *    (kf_dist, kf_dist2), all as display/output smoothing.
  *
- * 3. RANGE-AIDED POSITION, off by default. See USE_RANGE_CORRECTION
- *    below. This is the part that can turn dead reckoning into a real
- *    measurement - read the assumptions before switching it on.
+ * 3. RANGE-AIDED POSITION, now ON by default (USE_RANGE_CORRECTION).
+ *    This is the part that turns dead reckoning into a real
+ *    measurement - read the assumptions before trusting it.
  * ===================================================================== */
 
 #include <Wire.h>
@@ -99,13 +99,16 @@
  * of it, if you turn away so the beam hits something further off, or if
  * you approach at a steep angle. Then the "fixed surface" premise is
  * false and the correction will confidently drag position to the wrong
- * place. That is why it is off by default: get the probes drawing
- * correctly first, then switch it on with a wall or a board in front of
- * the needle and watch whether drift actually stops.
+ * place. RANGE_INNOV_MAX guards against the worst of it by refusing
+ * corrections that disagree violently with the IMU, but the guard is not
+ * a substitute for pointing the thing at a real, static, flat target.
  *
- * The correction only applies along whichever world axis the beam is
- * closest to parallel with, and only when that alignment is better than
- * BEAM_ALIGN_MIN. Off-axis geometry is left to the IMU.
+ * The measurement observes position PROJECTED onto the beam, so the
+ * update is spread across all three axes weighted by the beam direction.
+ * It works at any orientation - there is no alignment threshold.
+ *
+ * Watch range_state in the Slicer box to see whether it is actually
+ * running: 0 no target, 1 waiting to anchor, 2 locked, 3 rejecting.
  * ------------------------------------------------------------------- */
 #define USE_RANGE_CORRECTION 1
 #define RANGE_MEAS_VAR    36.0f    // (mm)^2; VL6180X is roughly +/-5 mm
