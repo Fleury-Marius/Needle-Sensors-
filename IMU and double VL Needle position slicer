@@ -97,6 +97,7 @@ PROBE2_NODE_NAME = "VL6180XProbe2"
 # frame (mm). The STL runs from Z=0 at the plunger to Z~147.6 at the tip,
 # so these sit just behind the tip looking out past the needle. Adjust to
 # match how they are actually glued on.
+# Keep these DIR values in sync with BEAM_BODY_* in the sketch.
 SENSOR1_LOCAL_POS = (3.0, 0.0, 145.0)
 SENSOR1_LOCAL_DIR = (0.0, 0.0, 1.0)
 SENSOR2_LOCAL_POS = (-3.0, 0.0, 145.0)
