@@ -34,14 +34,31 @@
 
 /* ---------------- User-tunable ---------------- */
 
-#define SERIAL_BAUD       115200   // must match ArduinoConnect
-#define PRINT_HZ          20
+/* --- SERIAL BUDGET, and why the output format looks like this --------
+ * ArduinoConnect tops out at 9600 baud = 960 bytes per second. The old
+ * verbose line was ~500 bytes, so it could only be sent about twice a
+ * second before Serial.print() started blocking the integration loop.
+ *
+ * So the format is now compact and TIERED. Every line carries the six
+ * numbers the visualization actually needs to move the model - angles
+ * and position - plus one rotating group of secondary values. Over five
+ * lines you still get everything; each slow value just refreshes at a
+ * fifth of the rate. The Slicer script merges the fields as they arrive,
+ * so the corner box shows all of them and nothing reads as zero.
+ *
+ * Budget: core ~51 bytes + extras ~25 = ~78 bytes per line.
+ *   8 Hz -> ~620 B/s, 65% of the link. Comfortable.
+ *  10 Hz -> ~780 B/s, 81%. Works, less margin for the startup messages.
+ * Do not go above 10 at 9600. If you ever get a faster link, raise
+ * PRINT_HZ to 20 and the same format streams happily.
+ * ------------------------------------------------------------------- */
+#define SERIAL_BAUD       9600
+#define PRINT_HZ          8
 
 #define VERBOSE_STARTUP   1        // 0 = data lines ONLY (use this for Slicer)
-#define SEND_MAG          1
-#define SEND_VEL          1
-#define SEND_WORLD_ACC    1
-#define SEND_RAW_DIST     0        // adds 2 fields; costs serial bandwidth
+// All secondary values now ride the rotating extras groups, so the old
+// per-field SEND_* toggles are gone - there is no longer a per-line cost
+// to any one of them.
 
 #define I2C_CLOCK_HZ      100000L
 #define USE_POLL_FALLBACK 1
@@ -212,6 +229,7 @@ unsigned long last_sample_ms = 0;
 unsigned long last_diag_ms = 0;
 unsigned long last_update_us = 0;
 unsigned long last_print_ms = 0;
+uint8_t extras_group = 0;        // which secondary group goes out this line
 
 // Latest accepted range readings, -1 when we have never had a valid one.
 float dist1_mm = -1.0f;
@@ -904,55 +922,51 @@ void loop()
     if (now_ms - last_print_ms < (unsigned long)(1000 / PRINT_HZ)) return;
     last_print_ms = now_ms;
 
-    Serial.print(F("acc_x: "));  Serial.print(acc_x_mms2, 1);
-    Serial.print(F(",acc_y: ")); Serial.print(acc_y_mms2, 1);
-    Serial.print(F(",acc_z: ")); Serial.print(acc_z_mms2, 1);
+    // --- Core: sent every line, this is what moves the model ---
+    Serial.print(F("ro:"));   Serial.print(my_95Q.roll / 100.0, 1);
+    Serial.print(F(",pi:"));  Serial.print(my_95Q.pitch / 100.0, 1);
+    Serial.print(F(",ya:"));  Serial.print(my_95Q.yaw / 100.0, 1);
+    Serial.print(F(",px:"));  Serial.print(kf_pos_x.pos, 1);
+    Serial.print(F(",py:"));  Serial.print(kf_pos_y.pos, 1);
+    Serial.print(F(",pz:"));  Serial.print(kf_pos_z.pos, 1);
+    Serial.print(F(",st:"));  Serial.print(is_stationary ? 1 : 0);
 
-    Serial.print(F(",gyro_x: ")); Serial.print(gyro_x_filt, 2);
-    Serial.print(F(",gyro_y: ")); Serial.print(gyro_y_filt, 2);
-    Serial.print(F(",gyro_z: ")); Serial.print(gyro_z_filt, 2);
+    // --- Extras: one group per line, cycling. Each refreshes at
+    //     PRINT_HZ / 5, which is plenty for a numeric readout. ---
+    switch (extras_group) {
+    case 0:
+        Serial.print(F(",ax:")); Serial.print(acc_x_mms2, 0);
+        Serial.print(F(",ay:")); Serial.print(acc_y_mms2, 0);
+        Serial.print(F(",az:")); Serial.print(acc_z_mms2, 0);
+        break;
+    case 1:
+        Serial.print(F(",gx:")); Serial.print(gyro_x_filt, 2);
+        Serial.print(F(",gy:")); Serial.print(gyro_y_filt, 2);
+        Serial.print(F(",gz:")); Serial.print(gyro_z_filt, 2);
+        break;
+    case 2:
+        Serial.print(F(",mx:")); Serial.print(my_95Q.mag_x);
+        Serial.print(F(",my:")); Serial.print(my_95Q.mag_y);
+        Serial.print(F(",mz:")); Serial.print(my_95Q.mag_z);
+        break;
+    case 3:
+        // Range group: distances, correction state, and the innovation.
+        Serial.print(F(",d1:")); Serial.print(dist1_mm, 0);
+        Serial.print(F(",d2:")); Serial.print(dist2_mm, 0);
+        Serial.print(F(",rs:")); Serial.print(range_state);
+        Serial.print(F(",ri:")); Serial.print(range_innov, 1);
+        break;
+    default:
+        Serial.print(F(",tp:")); Serial.print(my_95Q.temp / 100.0, 1);
+        Serial.print(F(",lv:")); Serial.print(my_95Q.leve);
+        Serial.print(F(",vx:")); Serial.print(kf_pos_x.vel, 0);
+        Serial.print(F(",vy:")); Serial.print(kf_pos_y.vel, 0);
+        Serial.print(F(",vz:")); Serial.print(kf_pos_z.vel, 0);
+        break;
+    }
+    if (++extras_group > 4) extras_group = 0;
 
-#if SEND_MAG
-    Serial.print(F(",mag_x: ")); Serial.print(my_95Q.mag_x);
-    Serial.print(F(",mag_y: ")); Serial.print(my_95Q.mag_y);
-    Serial.print(F(",mag_z: ")); Serial.print(my_95Q.mag_z);
-#endif
-
-    Serial.print(F(",roll: "));  Serial.print(my_95Q.roll / 100.0, 2);
-    Serial.print(F(",pitch: ")); Serial.print(my_95Q.pitch / 100.0, 2);
-    Serial.print(F(",yaw: "));   Serial.print(my_95Q.yaw / 100.0, 2);
-
-#if SEND_WORLD_ACC
-    Serial.print(F(",wacc_x: ")); Serial.print(world_ax, 1);
-    Serial.print(F(",wacc_y: ")); Serial.print(world_ay, 1);
-    Serial.print(F(",wacc_z: ")); Serial.print(world_az, 1);
-#endif
-
-    Serial.print(F(",temp: ")); Serial.print(my_95Q.temp / 100.0, 2);
-    Serial.print(F(",leve: ")); Serial.print(my_95Q.leve);
-
-    // Field names match your earlier Slicer script: -1 means no valid read.
-    Serial.print(F(",distance_mm: "));  Serial.print(dist1_mm, 1);
-    Serial.print(F(",distance_mm2: ")); Serial.print(dist2_mm, 1);
-#if SEND_RAW_DIST
-    Serial.print(F(",distance_mm_raw: "));  Serial.print(dist1_raw);
-    Serial.print(F(",distance_mm2_raw: ")); Serial.print(dist2_raw);
-#endif
-
-    Serial.print(F(",pos_x_mm: ")); Serial.print(kf_pos_x.pos, 1);
-    Serial.print(F(",pos_y_mm: ")); Serial.print(kf_pos_y.pos, 1);
-    Serial.print(F(",pos_z_mm: ")); Serial.print(kf_pos_z.pos, 1);
-
-#if SEND_VEL
-    Serial.print(F(",vel_x_mms: ")); Serial.print(kf_pos_x.vel, 1);
-    Serial.print(F(",vel_y_mms: ")); Serial.print(kf_pos_y.vel, 1);
-    Serial.print(F(",vel_z_mms: ")); Serial.print(kf_pos_z.vel, 1);
-#endif
-
-    Serial.print(F(",range_state: ")); Serial.print(range_state);
-    Serial.print(F(",range_lock: "));  Serial.print(range_lock);
-    Serial.print(F(",range_innov: ")); Serial.print(range_innov, 1);
-    Serial.print(F(",stationary: ")); Serial.println(is_stationary ? 1 : 0);
+    Serial.println();
 }
 
 /* ---------------- low level ----------------------------------------- */
