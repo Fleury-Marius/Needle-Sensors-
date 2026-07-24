@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Fri Jul 24 10:20:45 2026
-
-@author: mariofleury
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 GY-95T -> 3D Slicer live view: needle orientation + dead-reckoned position.
 
 CRASH-HARDENED VERSION. Changes vs. the previous script, all aimed at
@@ -581,12 +573,20 @@ class GY95TController:
     def _fmtRange(value):
         return "--" if value is None or value < 0 else f"{value:.0f} mm"
 
-    @staticmethod
-    def _fmtCorrection(data):
-        axis = int(data.get("range_axis", -1))
-        if axis < 0:
-            return ""
-        return f"   correcting {'XYZ'[axis]}"
+    RANGE_STATES = {
+        0: "no target in beam",
+        1: "waiting to anchor",
+        2: "LOCKED",
+        3: "reading rejected",
+    }
+
+    @classmethod
+    def _fmtCorrection(cls, data):
+        state = int(data.get("range_state", 0))
+        label = cls.RANGE_STATES.get(state, "?")
+        if state == 2:
+            return f"   {label}, innov {data.get('range_innov', 0):+.1f} mm"
+        return f"   [{label}]"
 
     # --------------------------------------------------------- controls
     def setProbes(self, visible):
