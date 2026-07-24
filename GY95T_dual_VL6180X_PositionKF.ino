@@ -34,7 +34,7 @@
 
 /* ---------------- User-tunable ---------------- */
 
-#define SERIAL_BAUD       115200   // must match ArduinoConnect
+#define SERIAL_BAUD       9600   // must match ArduinoConnect
 #define PRINT_HZ          20
 
 #define VERBOSE_STARTUP   1        // 0 = data lines ONLY (use this for Slicer)
