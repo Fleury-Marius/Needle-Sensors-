@@ -75,6 +75,25 @@
 #define GYRO_SCALE      (GYRO_RANGE_DPS / 32768.0f)
 #define GRAVITY_SIGN    1.0f
 
+/* --- ACCELEROMETER SCALE CORRECTION -----------------------------------
+ * ACC_RANGE_G assumes the part is exactly +/-16g. It never is. Your own
+ * captures showed roughly 9844 and 9867 mm/s^2 on Z while at rest, where
+ * true gravity is 9806.65 - a scale error of about half a percent.
+ *
+ * That matters far more than it looks, and it hurts VERTICAL worst. An
+ * additive bias calibration cannot remove it, because the error is
+ * PROPORTIONAL to the reading: calibrate it away lying flat and it comes
+ * straight back when you tilt, since the axis carrying gravity changed.
+ * Half a percent of 9806 is ~50 mm/s^2 of phantom acceleration, which
+ * double-integrates to 25 mm in one second and 2.5 m in ten.
+ *
+ * So we measure the true scale at startup instead of trusting the
+ * datasheet: at rest the acceleration magnitude must be exactly 1g, and
+ * whatever factor makes that true is the correction.
+ * ------------------------------------------------------------------- */
+#define ACC_GAIN_MIN    0.95f
+#define ACC_GAIN_MAX    1.05f
+
 /* --- Position filter --- */
 #define Q_ACCEL_VAR     4000.0f
 #define VEL_TAU_S       4.0f
@@ -128,8 +147,13 @@
 
 // Beam direction in the BODY frame. Your Slicer script mounts the probes
 // along local +Z (out past the needle), so this matches it. The
-// correction now works at ANY orientation, not just when the beam is
-// close to a world axis, so there is no alignment threshold any more.
+// correction works at ANY orientation, not just when the beam is close
+// to a world axis, so there is no alignment threshold.
+//
+// NOTE: a rangefinder constrains only the direction it looks along, so
+// with both sensors aimed this way you get one measured axis and two
+// that remain dead-reckoned. Re-aiming one sensor perpendicular is the
+// hardware fix for vertical/lateral, if you want it later.
 #define BEAM_BODY_X  0.0f
 #define BEAM_BODY_Y  0.0f
 #define BEAM_BODY_Z  1.0f
@@ -337,11 +361,17 @@ float acc_bias_world_x = 0.0f;
 float acc_bias_world_y = 0.0f;
 float acc_bias_world_z = 0.0f;
 
+// Multiplicative correction on every accel reading, measured at startup.
+float acc_gain = 1.0f;
+
 float yaw_ref_deg = 0.0f;
 unsigned long stationary_since_ms = 0;
 
-// Range-correction anchor: the range reading captured when the surface
-// reference was established, and which axis it is being applied to.
+// Range-correction anchor and status. Published to Slicer as range_state:
+//   0 no usable reading - nothing within range of the beam
+//   1 waiting for a steady reading before anchoring
+//   2 locked and correcting
+//   3 reading rejected as an outlier (edge crossing, or target moved)
 bool  range_anchored = false;
 float range_anchor_C = 0.0f;     // (position along beam + range) at anchor
 float last_range_mm = -1.0f;
@@ -349,12 +379,6 @@ float range_innov = 0.0f;        // measurement minus estimate, mm
 uint8_t range_reject_count = 0;
 uint8_t range_lock = 0;          // 1 while the range is actively correcting
 unsigned long range_stable_since_ms = 0;
-
-// Why the correction is or is not running, published to Slicer:
-//   0 no usable reading - nothing within range of the beam
-//   1 waiting for a steady reading before anchoring
-//   2 locked and correcting
-//   3 reading rejected as an outlier (edge crossing, or target moved)
 uint8_t range_state = 0;
 
 float referencedYaw()
@@ -501,6 +525,8 @@ void applyRangeCorrection(bool is_stationary)
     (void)is_stationary;
     range_lock = 0;
 
+    // Both sensors look the same way, so averaging the valid ones halves
+    // the noise. It does not buy a second axis.
     float d;
     if (dist1_mm >= 0.0f && dist2_mm >= 0.0f) d = 0.5f * (dist1_mm + dist2_mm);
     else if (dist1_mm >= 0.0f)                d = dist1_mm;
@@ -521,8 +547,7 @@ void applyRangeCorrection(bool is_stationary)
 
     if (!range_anchored) {
         // Anchor as soon as the reading holds steady, whether or not the
-        // stationary detector agrees. Requiring ZUPT here meant a fussy
-        // threshold could stop the correction from ever starting.
+        // stationary detector agrees.
         if (last_range_mm < 0.0f || fabs(d - last_range_mm) > RANGE_STABLE_MM) {
             range_stable_since_ms = 0;
         } else if (range_stable_since_ms == 0) {
@@ -545,6 +570,8 @@ void applyRangeCorrection(bool is_stationary)
     }
     last_range_mm = d;
 
+    // The number you watch: what the rangefinder measures, minus what
+    // double-integration predicted. Your live drift readout in mm.
     range_innov = (range_anchor_C - d) - p_along;
 
     if (fabs(range_innov) > RANGE_INNOV_MAX) {
@@ -700,21 +727,36 @@ void calibrate()
 
     float n = (float)collected;
 
-    acc_bias_world_x = (sum_wx / n) * ACC_G_TO_MMS2;
-    acc_bias_world_y = (sum_wy / n) * ACC_G_TO_MMS2;
-    acc_bias_world_z = ((sum_wz / n) - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
-
     float mean_am = sum_am / n;
     float std_am  = sqrt(fmax(0.0f, sum_am2 / n - mean_am * mean_am));
     float mean_gm = sum_gm / n;
     float std_gm  = sqrt(fmax(0.0f, sum_gm2 / n - mean_gm * mean_gm));
 
+    // Scale correction first: at rest |a| must be exactly 1g, so the
+    // factor that makes it so is the true scale error. This has to come
+    // before the bias, because bias is what is left AFTER scaling.
+    if (mean_am > 0.5f && mean_am < 1.5f) {
+        acc_gain = 1.0f / mean_am;
+        if (acc_gain < ACC_GAIN_MIN) acc_gain = ACC_GAIN_MIN;
+        if (acc_gain > ACC_GAIN_MAX) acc_gain = ACC_GAIN_MAX;
+    }
+
+    // Sums were accumulated ungained; rotation is linear, so scaling the
+    // averages afterwards is equivalent to having scaled every sample.
+    acc_bias_world_x = (sum_wx / n) * acc_gain * ACC_G_TO_MMS2;
+    acc_bias_world_y = (sum_wy / n) * acc_gain * ACC_G_TO_MMS2;
+    acc_bias_world_z = ((sum_wz / n) * acc_gain - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
+
+    std_am *= acc_gain;
     tol_acc_std    = fmax(3.0f * std_am, 0.003f);
     tol_acc_offset = fmax(6.0f * std_am, 0.012f);
     tol_gyro       = fmax(mean_gm + 6.0f * std_gm, 3.0f);
 
 #if VERBOSE_STARTUP
     Serial.print(F("# OK samples=")); Serial.println(collected);
+    Serial.print(F("# Accel scale gain=")); Serial.print(acc_gain, 5);
+    Serial.print(F("  (raw |a| was ")); Serial.print(mean_am, 5);
+    Serial.println(F(" g at rest; 1.00000 would be perfect)"));
     Serial.print(F("# Bias mm/s^2 x=")); Serial.print(acc_bias_world_x, 2);
     Serial.print(F(" y=")); Serial.print(acc_bias_world_y, 2);
     Serial.print(F(" z=")); Serial.println(acc_bias_world_z, 2);
@@ -792,9 +834,12 @@ void loop()
     last_update_us = now_us;
     if (dt <= 0.0f || dt > 0.25f) dt = delay_t / 1000.0f;
 
-    float acc_x_g = my_95Q.acc_x * ACC_SCALE;
-    float acc_y_g = my_95Q.acc_y * ACC_SCALE;
-    float acc_z_g = my_95Q.acc_z * ACC_SCALE;
+    // acc_gain removes the datasheet-vs-reality scale error. Without it a
+    // half-percent error becomes ~50 mm/s^2 of phantom vertical
+    // acceleration the moment you tilt away from the calibration pose.
+    float acc_x_g = my_95Q.acc_x * ACC_SCALE * acc_gain;
+    float acc_y_g = my_95Q.acc_y * ACC_SCALE * acc_gain;
+    float acc_z_g = my_95Q.acc_z * ACC_SCALE * acc_gain;
 
     float gyro_x_dps = my_95Q.gyro_x * GYRO_SCALE;
     float gyro_y_dps = my_95Q.gyro_y * GYRO_SCALE;
