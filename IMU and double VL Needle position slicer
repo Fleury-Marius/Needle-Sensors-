@@ -113,25 +113,48 @@ BOX_FONT_MAX = 18
 BOX_COMPACT  = False    # True = the five-line layout only
 
 
-def parse_line(raw):
-    """Parse 'key: value, key: value, ...' into a dict of floats.
+# The sketch sends compact keys to fit inside 9600 baud. Long names are
+# still accepted, so an older sketch keeps working unchanged.
+KEY_MAP = {
+    "ro": "roll",   "pi": "pitch",  "ya": "yaw",
+    "px": "pos_x_mm", "py": "pos_y_mm", "pz": "pos_z_mm",
+    "vx": "vel_x_mms", "vy": "vel_y_mms", "vz": "vel_z_mms",
+    "ax": "acc_x",  "ay": "acc_y",  "az": "acc_z",
+    "gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z",
+    "mx": "mag_x",  "my": "mag_y",  "mz": "mag_z",
+    "d1": "distance_mm", "d2": "distance_mm2",
+    "rs": "range_state", "ri": "range_innov", "rl": "range_lock",
+    "tp": "temp",   "lv": "leve",   "st": "stationary",
+}
 
-    The serial stream can arrive concatenated or truncated, so scan every
-    line and keep the last complete one."""
-    best = {}
-    for line in str(raw).replace("\r", "\n").split("\n"):
-        data = {}
+
+def parse_line(raw):
+    """Parse every complete line in the buffer into one dict of floats.
+
+    At 9600 baud the sketch cannot afford to send every field on every
+    line, so it rotates the secondary values across five lines. This
+    returns whatever arrived; the controller merges it into a persistent
+    state dict so nothing reads as zero just because it was not in the
+    most recent line."""
+    out = {}
+    text = str(raw).replace("\r", "\n")
+    lines = text.split("\n")
+
+    for idx, line in enumerate(lines):
+        # The last line may be a partial write still in flight. Keep it
+        # only if the buffer ended cleanly.
+        if idx == len(lines) - 1 and not text.endswith("\n") and len(lines) > 1:
+            continue
         for token in line.split(","):
             if ":" not in token:
                 continue
             key, val = token.split(":", 1)
+            key = key.strip()
             try:
-                data[key.strip()] = float(val.strip())
+                out[KEY_MAP.get(key, key)] = float(val.strip())
             except ValueError:
                 pass
-        if all(k in data for k in ("roll", "pitch", "yaw")):
-            best = data
-    return best
+    return out
 
 
 def euler_to_rotation_matrix(roll_deg, pitch_deg, yaw_deg):
@@ -409,6 +432,7 @@ class GY95TController:
         self.clamped = False
         self._warnedNoPosition = False
 
+        self.state = {}             # merged field values across lines
         self._pending = None        # written by observer, read by timer
         self._busy = False          # reentrancy guard
         self._errors = 0
@@ -473,8 +497,15 @@ class GY95TController:
             self._busy = False
 
     def _update(self, payload):
-        data = parse_line(payload)
-        if not data:
+        incoming = parse_line(payload)
+        if not incoming:
+            return
+
+        # Merge rather than replace: each line carries the pose plus only
+        # one group of secondary values.
+        self.state.update(incoming)
+        data = self.state
+        if not all(k in data for k in ("roll", "pitch", "yaw")):
             return
         self._samples += 1
 
