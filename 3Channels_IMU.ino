@@ -87,6 +87,17 @@
 #define RANGE_MAX_VALID   (200 * RANGE_SCALING)   // mm
 
 /* --- IMU scaling --- */
+// The module reverted to its FACTORY DEFAULT +/-16g after a full power
+// cycle - the earlier stray 2g setting did NOT persist. Confirmed from
+// data: rest az read raw ~2048 counts, which is 1g ONLY at the 16g scale
+// (the code briefly assumed 2g and so read 1/8 g at rest, killing motion
+// sensitivity). We now match the reliable power-up default and write
+// nothing, so code and hardware always agree regardless of power cycling.
+//
+// Trade-off vs 2g: 16g has coarser resolution, which is why slow motion is
+// harder to sense. But it is the state the module reliably boots into, so
+// matching it is more robust than chasing a non-persistent 2g setting. The
+// range sensors are what carry forward-motion precision anyway.
 #define ACC_RANGE_G     16.0f
 #define ACC_SCALE       (ACC_RANGE_G / 32768.0f)
 #define ACC_G_TO_MMS2   9806.65f
@@ -115,7 +126,11 @@
 
 /* --- Position filter --- */
 #define Q_ACCEL_VAR     4000.0f
-#define VEL_TAU_S       4.0f
+// Velocity leak time constant, seconds. Was 4.0, which bled a slow push
+// away before it accumulated into visible position. 10 s barely damps
+// deliberate motion while still bounding long-term drift. Raise further
+// (or set 0 to disable) if slow forward motion still reads short.
+#define VEL_TAU_S       10.0f
 #define STAT_HOLD_MS    300UL
 #define ZERO_YAW_AT_START 1
 #define CAL_SAMPLES     200
@@ -150,7 +165,21 @@
  * 2 locked, 3 rejecting.
  * ------------------------------------------------------------------- */
 #define USE_RANGE_CORRECTION 1
-#define RANGE_MEAS_VAR    36.0f    // (mm)^2; VL6180X is roughly +/-5 mm
+// Measurement variance for the range correction, (mm)^2. This is the
+// TRUST knob: it tells the filter how noisy the range reading is, and the
+// Kalman gain weighs it against the accelerometer accordingly. LOWER =
+// trust the distance sensor MORE (the correction pulls position harder
+// toward what the sensor says, and leans less on double-integration).
+//
+// Dropped from 36 to 9: the VL6180X at close range is good to a few mm,
+// and a direct distance measurement is far more reliable than twice-
+// integrated acceleration. At 9, a forward push that shrinks the range is
+// followed promptly - the needle moves forward because the SENSOR says so,
+// not because the accel integration happened to catch it.
+//
+// Push lower (4, or 1) for even more trust, at the cost of the position
+// twitching with sensor noise. Raise back toward 36 if it gets jittery.
+#define RANGE_MEAS_VAR    9.0f     // (mm)^2; VL6180X close-range ~+/-3 mm
 
 // Reject any correction that disagrees with the current estimate by more
 // than this. Sweeping off the edge of the target produces a sudden step
@@ -186,6 +215,16 @@
 // creeps. 1.5 mm at 8 Hz corresponds to about 12 mm/s.
 #define RANGE_CREEP_MM    1.5f
 
+// Dead-band: if a locked sensor's own range moves less than this between
+// samples, treat it as flat and apply NO correction from it - a flat
+// sensor only adds noise on its axis, which fights motion on the others.
+// This is the fix for "push forward on a surface and it resists": the
+// side sensor stays flat during a forward push and now stays quiet.
+// Set a hair above your range noise floor (VL6180X ~1 mm). Too high and
+// slow motion along that sensor's own axis gets ignored; too low and the
+// cross-coupling returns.
+#define RANGE_FLAT_MM     2.0f
+
 
 #define RANGE_REJECT_MAX  15       // consecutive rejects before re-anchoring
 #define RANGE_STABLE_MM   3.0f     // reading must be this steady to anchor
@@ -216,17 +255,32 @@
  * sensor 2 right), just swap the two blocks below - nothing else changes.
  * These must stay in sync with SENSOR1/2_LOCAL_DIR in the Slicer script.
  * ------------------------------------------------------------------- */
-#define BEAM1_BODY_X  -1.0f     // sensor 1 -> -X (points left, per hardware)
-#define BEAM1_BODY_Y  0.0f
+/* --- BEAM DIRECTIONS, in the BODY frame -------------------------------
+ * Module is LEVEL (gravity on Z, roll/pitch ~0). Earlier a tilt was
+ * diagnosed, but that was during the corrupted 2g-scale period and was
+ * almost certainly an artifact - with the scale fixed, orientation reads
+ * level, matching the actual mount. So we use the straightforward level
+ * mapping:  body +X = sideways,  +Y = forward (at phantom),  +Z = up.
+ *
+ * Physical aim: sensor 1 -> phantom (forward) = body +Y.
+ *               sensor 2 -> sideways           = body +X.
+ *
+ * rotateBodyToWorld() maps these to world axes each sample. Verify
+ * empirically: push toward the phantom and channel 1's innov should move;
+ * push sideways and channel 2's should. If swapped, exchange the blocks.
+ * ------------------------------------------------------------------- */
+#define BEAM1_BODY_X  0.0f
+#define BEAM1_BODY_Y  1.0f      // sensor 1 -> +Y (forward, at phantom)
 #define BEAM1_BODY_Z  0.0f
 
-#define BEAM2_BODY_X  0.0f
-#define BEAM2_BODY_Y  1.0f      // sensor 2 -> +Y (forward)
+#define BEAM2_BODY_X  1.0f      // sensor 2 -> +X (sideways)
+#define BEAM2_BODY_Y  0.0f
 #define BEAM2_BODY_Z  0.0f
 
+// Sensor 3 disconnected; left defined so the struct/serial stay intact.
 #define BEAM3_BODY_X  0.0f
 #define BEAM3_BODY_Y  0.0f
-#define BEAM3_BODY_Z  1.0f      // sensor 3 -> +Z (up), the vertical channel
+#define BEAM3_BODY_Z  1.0f      // would be +Z (up) if reconnected
 
 
 /* ---------------------------------------------------------------------
@@ -302,6 +356,7 @@ volatile byte ready_Ok = 0;
 volatile unsigned long int_count = 0;
 
 unsigned long i2c_fail_count = 0;
+unsigned long corrupt_count = 0;
 unsigned long sample_count = 0;
 unsigned long last_sample_ms = 0;
 unsigned long last_diag_ms = 0;
@@ -356,6 +411,14 @@ void posvelPredict(PosVelKF *kf, float accel, float dt, float q_accel_var)
 {
     kf->pos += kf->vel * dt + 0.5f * accel * dt * dt;
     kf->vel += accel * dt;
+
+    // Backstop against a corrupt sample that slips past the guard: a hand
+    // or needle never exceeds ~2 m/s. Clamp velocity to that, so a single
+    // bad acceleration cannot integrate position off to tens of metres
+    // (as seen when pz ran to -23000). Real motion is unaffected.
+    const float VEL_MAX_MMS = 2000.0f;   // 2 m/s
+    if (kf->vel >  VEL_MAX_MMS) kf->vel =  VEL_MAX_MMS;
+    if (kf->vel < -VEL_MAX_MMS) kf->vel = -VEL_MAX_MMS;
 
     float dt2 = dt * dt;
     float dt3 = dt2 * dt;
@@ -694,32 +757,23 @@ void updateRangeChannel(RangeChannel *ch, float ux, float uy, float uz,
 
     ch->innov = (ch->anchor_C - d) - p_along;
 
-    // --- Deciding whether to trust this reading -----------------------
-    // The old rule "don't correct while stationary" was wrong: a SLOW
-    // forward push produces almost no acceleration, so the IMU still
-    // reads stationary, and re-baselining the anchor every sample made
-    // that motion invisible - the sensor watched you approach the target
-    // while the code kept calling the new distance "zero".
-    //
-    // The real tell for a hand vs. real motion is not the accelerometer,
-    // it is whether the range is changing SMOOTHLY. A hand block is a
-    // step (already caught by the jump guard above). A steady creep is
-    // motion, and must be corrected even when the IMU calls it stationary.
-    //
-    // So: only re-baseline when the device is BOTH stationary AND the
-    // range is genuinely flat (not creeping). Otherwise, correct.
-#if RANGE_TRUST_WHILE_MOVING_ONLY
-    float creep = fabs(d - ch->last_mm);   // change since previous accepted mm
-    if (stationary && creep < RANGE_CREEP_MM) {
-        ch->anchor_C = p_along + d;   // truly still: adopt reading as zero
-        ch->innov = 0.0f;
-        ch->state = 2;
+    // --- Apply only when the innovation is above the noise floor ---------
+    // innov is the accumulated disagreement between what the range sensor
+    // measures and what the position estimate predicts, measured from the
+    // STABLE anchor set at lock time. It is allowed to GROW across samples,
+    // so even a slow push (small change per sample) eventually clears the
+    // floor and gets corrected. The anchor is NOT reset here - resetting it
+    // when the reading looked flat was the bug that pinned innov at 0 and
+    // made forward motion invisible.
+    if (fabs(ch->innov) < RANGE_FLAT_MM) {
+        ch->state = 2;                // locked, idle (below noise floor)
         ch->reject_count = 0;
-        ch->last_mm = d;
         return;
     }
-#endif
 
+    // Outlier gate: an innovation this large means the surface premise
+    // broke (edge crossing, target moved, or a jump). Reject it; if it
+    // persists, the old anchor is stale so adopt the current reading.
     if (fabs(ch->innov) > RANGE_INNOV_MAX) {
         ch->state = 3;
         if (++ch->reject_count > RANGE_REJECT_MAX) {
@@ -796,6 +850,62 @@ bool sampleReady()
     return false;
 }
 
+// Reject a sample whose contents are physically impossible - the
+// signature of a corrupted I2C read on a marginal bus (floating lines,
+// loose breadboard jumpers). Seen in captures: roll/pitch/yaw snapping to
+// exactly 0.0 mid-motion, magnetometer jumping to thousands, accel
+// magnitude collapsing to ~0.5 g. Integrating even one such sample throws
+// position metres off. This is a SEATBELT, not a fix - proper pull-up
+// resistors on SDA/SCL are the real cure - but it stops one bad read from
+// destroying the whole track.
+// Master switch for the corruption guard. Default OFF - it was rejecting
+// good data on some setups, and a rejected-everything guard is worse than
+// no guard. Turn ON only if you see position explode from bus corruption,
+// and watch the "# corrupt reason=" line to confirm it's catching real
+// garbage and not eating clean samples.
+// Guard ON, but only the SAFE checks. Last time it rejected good data
+// because the accel/mag bounds were too tight; those are now widened and,
+// more importantly, the PRIMARY check is the one that never false-fires:
+// roll==pitch==yaw==EXACTLY 0.0, which real fused output never produces
+// but a corrupt I2C read does (seen repeatedly in captures, right before
+// pz explodes). This alone stops the runaway that has wrecked every long
+// capture. The accel/mag checks are backups with generous bounds.
+#define USE_CORRUPTION_GUARD 1
+
+// When the guard is on, this records why the last rejection happened:
+//   1 orientation exactly 0/0/0   2 accel magnitude out of band
+//   3 magnetometer out of envelope
+uint8_t corrupt_reason = 0;
+
+bool sampleLooksCorrupt()
+{
+#if !USE_CORRUPTION_GUARD
+    return false;                       // guard disabled
+#else
+    // 1. Orientation exactly zero on all three axes.
+    if (my_95Q.roll == 0 && my_95Q.pitch == 0 && my_95Q.yaw == 0) {
+        corrupt_reason = 1; return true;
+    }
+
+    // 2. Accel magnitude far from 1 g. Wide band so brisk motion is fine.
+    float ax = my_95Q.acc_x * ACC_SCALE;
+    float ay = my_95Q.acc_y * ACC_SCALE;
+    float az = my_95Q.acc_z * ACC_SCALE;
+    float amag = sqrt(ax*ax + ay*ay + az*az);
+    if (amag < 0.4f || amag > 3.0f) {   // widened from 0.5-2.5
+        corrupt_reason = 2; return true;
+    }
+
+    // 3. Magnetometer wildly out of envelope.
+    if (abs(my_95Q.mag_x) > 5000 || abs(my_95Q.mag_y) > 5000
+        || abs(my_95Q.mag_z) > 5000) {  // widened from 3000
+        corrupt_reason = 3; return true;
+    }
+
+    return false;
+#endif
+}
+
 bool readIMU()
 {
     unsigned char data[27] = {0};
@@ -804,6 +914,15 @@ bool readIMU()
         return false;
     }
     memcpy(&my_95Q, data, 27);
+
+    if (sampleLooksCorrupt()) {
+        corrupt_count++;
+        // Do NOT update last_sample_ms/sample_count or integrate: treat it
+        // as if the sample never arrived. The filter simply pauses for this
+        // frame and resumes on the next clean one.
+        return false;
+    }
+
     last_sample_ms = millis();
     sample_count++;
     return true;
@@ -843,6 +962,20 @@ void serviceDiagnostics()
     unsigned long now = millis();
     if (now - last_diag_ms < DIAG_PERIOD_MS) return;
     last_diag_ms = now;
+
+    // If corrupt samples are being rejected, report the rate - this is the
+    // live readout of bus health. A nonzero count means the guard is
+    // catching bad I2C reads; a rising count means add pull-up resistors.
+    if (corrupt_count > 0) {
+        Serial.print(F("# rejected "));
+        Serial.print(corrupt_count);
+        Serial.print(F(" corrupt samples (last reason="));
+        Serial.print(corrupt_reason);
+        Serial.print(F(") in last "));
+        Serial.print(DIAG_PERIOD_MS / 1000);
+        Serial.println(F("s"));
+        corrupt_count = 0;
+    }
 
     if (sample_count > 0) { sample_count = 0; return; }
 
