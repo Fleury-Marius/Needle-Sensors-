@@ -1,0 +1,1676 @@
+/* =====================================================================
+ * GY-95T + dual VL6180X -> 3D Slicer
+ * Orientation, dead-reckoned position, and two live range probes.
+ * Target: Arduino UNO (ATmega328P)
+ * ---------------------------------------------------------------------
+ * This is yesterday's IMU sketch with the distance sensors merged back
+ * in. Three things to know before reading further:
+ *
+ * 1. THE RANGE READS ARE NON-BLOCKING NOW. Your original sketch called
+ *    readRangeSingleMillimeters() on both sensors inside the sample
+ *    loop. That call starts a measurement and then sits there polling
+ *    until it finishes - roughly 10 ms per sensor, so ~20 ms of dead
+ *    time every pass. That was tolerable when the sketch only printed
+ *    angles. It is not tolerable now: position integration needs a
+ *    steady dt at ~50 Hz, and 20 ms of blocking per pass wrecks it.
+ *    Both sensors now run in continuous mode and we simply check "is a
+ *    new sample sitting in the register?" each pass. If yes we take it,
+ *    if no we move on. The IMU loop never waits for the rangefinders.
+ *
+ * 2. FILTERING. You mentioned you only had Kalman filters on acc_x/y.
+ *    Filters are now on acc x/y/z, gyro x/y/z, and both range channels
+ *    (kf_dist, kf_dist2), all as display/output smoothing.
+ *
+ * 3. RANGE-AIDED POSITION, now ON by default (USE_RANGE_CORRECTION).
+ *    This is the part that turns dead reckoning into a real
+ *    measurement - read the assumptions before trusting it.
+ * ===================================================================== */
+
+#include <Wire.h>
+#include <VL6180X.h>
+#include <math.h>
+
+#define iic_add  (0xa4 >> 1)
+
+/* ---------------- User-tunable ---------------- */
+
+/* --- SERIAL BUDGET, and why the output format looks like this --------
+ * ArduinoConnect tops out at 9600 baud = 960 bytes per second. The old
+ * verbose line was ~500 bytes, so it could only be sent about twice a
+ * second before Serial.print() started blocking the integration loop.
+ *
+ * So the format is now compact and TIERED. Every line carries the six
+ * numbers the visualization actually needs to move the model - angles
+ * and position - plus one rotating group of secondary values. Over five
+ * lines you still get everything; each slow value just refreshes at a
+ * fifth of the rate. The Slicer script merges the fields as they arrive,
+ * so the corner box shows all of them and nothing reads as zero.
+ *
+ * Budget: core ~51 bytes + extras ~25 = ~78 bytes per line.
+ *  At 115200 baud (~11520 B/s):
+ *   40 Hz -> ~3120 B/s, 27% of the link. Comfortable, 5x the old detail.
+ *   60 Hz -> ~4680 B/s, 41%. Also fine if you want even finer resolution.
+ * The old 9600-baud limit (max ~10 Hz) was the real cap on how finely
+ * quick rotations could be captured downstream; 115200 removes it.
+ * Slicer's serial connection MUST be set to the SAME baud (115200) or
+ * the data will arrive as garbage.
+ *
+ * NOTE: SERIAL_BAUD below is still 9600 - this comment describes the
+ * 115200 upgrade but the #define was never changed to match. Left as-is
+ * (not part of this pass); PRINT_HZ stays capped around 8-10 until
+ * SERIAL_BAUD is actually raised to 115200 AND the Slicer-side serial
+ * connection is changed to match.
+ * ------------------------------------------------------------------- */
+#define SERIAL_BAUD       9600
+#define PRINT_HZ          8
+
+#define VERBOSE_STARTUP   1        // 0 = data lines ONLY (use this for Slicer)
+// All secondary values now ride the rotating extras groups, so the old
+// per-field SEND_* toggles are gone - there is no longer a per-line cost
+// to any one of them.
+
+#define I2C_CLOCK_HZ      100000L
+#define USE_POLL_FALLBACK 1
+
+/* --- VL6180X wiring ---------------------------------------------------
+ * Both breakouts power up at address 0x29, so they cannot share the bus
+ * until one is renamed. Each SHUT pin must go to its own Arduino pin so
+ * we can hold one in reset while addressing the other. */
+#define SENSOR1_SHUT_PIN  4
+#define SENSOR2_SHUT_PIN  5
+#define SENSOR3_SHUT_PIN  6
+#define SENSOR4_SHUT_PIN  7      // fourth sensor: +X, differential partner of s2
+#define SENSOR2_ADDRESS   0x30     // any free 7-bit address that is not 0x29
+#define SENSOR3_ADDRESS   0x31     // third sensor, another free address
+#define SENSOR4_ADDRESS   0x32     // fourth sensor, another free address
+#define RANGE_PERIOD_MS   50       // continuous-mode period, multiple of 10
+
+// VL6180X range scaling. The part is designed for short range and this is
+// the lever that trades resolution for reach:
+//   1 -> 1 mm resolution, usable to roughly 200 mm  (default)
+//   2 -> 2 mm resolution, usable to roughly 400 mm
+//   3 -> 3 mm resolution, usable to roughly 600 mm
+// Scaling 1 gives the best correction quality but means the needle has to
+// stay within ~20 cm of the target or the correction simply stops. If you
+// keep losing lock because you work further out, try 2. Update
+// RANGE_MEAS_VAR below if you do - coarser scaling is noisier.
+#define RANGE_SCALING     1
+#define RANGE_MAX_VALID   (200 * RANGE_SCALING)   // mm
+
+/* --- IMU scaling --- */
+// The module reverted to its FACTORY DEFAULT +/-16g after a full power
+// cycle - the earlier stray 2g setting did NOT persist. Confirmed from
+// data: rest az read raw ~2048 counts, which is 1g ONLY at the 16g scale
+// (the code briefly assumed 2g and so read 1/8 g at rest, killing motion
+// sensitivity). We now match the reliable power-up default and write
+// nothing, so code and hardware always agree regardless of power cycling.
+//
+// Trade-off vs 2g: 16g has coarser resolution, which is why slow motion is
+// harder to sense. But it is the state the module reliably boots into, so
+// matching it is more robust than chasing a non-persistent 2g setting. The
+// range sensors are what carry forward-motion precision anyway.
+#define ACC_RANGE_G     16.0f
+#define ACC_SCALE       (ACC_RANGE_G / 32768.0f)
+#define ACC_G_TO_MMS2   9806.65f
+#define GYRO_RANGE_DPS  2000.0f
+#define GYRO_SCALE      (GYRO_RANGE_DPS / 32768.0f)
+#define GRAVITY_SIGN    1.0f
+
+/* --- ACCELEROMETER SCALE CORRECTION -----------------------------------
+ * ACC_RANGE_G assumes the part is exactly +/-16g. It never is. Your own
+ * captures showed roughly 9844 and 9867 mm/s^2 on Z while at rest, where
+ * true gravity is 9806.65 - a scale error of about half a percent.
+ *
+ * That matters far more than it looks, and it hurts VERTICAL worst. An
+ * additive bias calibration cannot remove it, because the error is
+ * PROPORTIONAL to the reading: calibrate it away lying flat and it comes
+ * straight back when you tilt, since the axis carrying gravity changed.
+ * Half a percent of 9806 is ~50 mm/s^2 of phantom acceleration, which
+ * double-integrates to 25 mm in one second and 2.5 m in ten.
+ *
+ * So we measure the true scale at startup instead of trusting the
+ * datasheet: at rest the acceleration magnitude must be exactly 1g, and
+ * whatever factor makes that true is the correction.
+ * ------------------------------------------------------------------- */
+#define ACC_GAIN_MIN    0.95f
+#define ACC_GAIN_MAX    1.05f
+
+/* --- Position filter --- */
+#define Q_ACCEL_VAR     4000.0f
+// Velocity leak time constant, seconds. Was 4.0, which bled a slow push
+// away before it accumulated into visible position. 10 s barely damps
+// deliberate motion while still bounding long-term drift. Raise further
+// (or set 0 to disable) if slow forward motion still reads short.
+#define VEL_TAU_S       10.0f
+#define STAT_HOLD_MS    300UL
+#define ZERO_YAW_AT_START 1
+#define CAL_SAMPLES     200
+#define STAT_WIN        8
+#define BIAS_TRACK_A    0.02f
+#define DIAG_PERIOD_MS  2000UL
+
+/* --- RANGE-AIDED POSITION ---------------------------------------------
+ * Set to 1 to let the rangefinders correct the position estimate.
+ *
+ * WHAT IT ASSUMES: the sensors are pointing at a flat surface that does
+ * not move, roughly square-on. Under that assumption the surface point
+ * is fixed in world space, so (position along the beam) + (measured
+ * range) is a constant. Measure the range, and you have measured your
+ * own position along that direction - a real observation, not an
+ * integration. That is what bounds drift properly.
+ *
+ * WHEN IT WILL HURT YOU: if the target moves, if you sweep off the edge
+ * of it, if you turn away so the beam hits something further off, or if
+ * you approach at a steep angle. Then the "fixed surface" premise is
+ * false and the correction will confidently drag position to the wrong
+ * place. RANGE_INNOV_MAX guards against the worst of it by refusing
+ * corrections that disagree violently with the IMU, but the guard is not
+ * a substitute for pointing the thing at a real, static, flat target.
+ *
+ * The measurement observes position PROJECTED onto the beam, so the
+ * update is spread across all three axes weighted by the beam direction.
+ * It works at any orientation - there is no alignment threshold.
+ *
+ * Watch the two range lines in the Slicer box (one per sensor) to see
+ * whether each is correcting: 0 no target, 1 waiting to anchor,
+ * 2 locked, 3 rejecting.
+ * ------------------------------------------------------------------- */
+#define USE_RANGE_CORRECTION 1
+// Measurement variance for the range correction, (mm)^2. This is the
+// TRUST knob: it tells the filter how noisy the range reading is, and the
+// Kalman gain weighs it against the accelerometer accordingly. LOWER =
+// trust the distance sensor MORE (the correction pulls position harder
+// toward what the sensor says, and leans less on double-integration).
+//
+// Dropped from 36 to 9: the VL6180X at close range is good to a few mm,
+// and a direct distance measurement is far more reliable than twice-
+// integrated acceleration. At 9, a forward push that shrinks the range is
+// followed promptly - the needle moves forward because the SENSOR says so,
+// not because the accel integration happened to catch it.
+//
+// Push lower (4, or 1) for even more trust, at the cost of the position
+// twitching with sensor noise. Raise back toward 36 if it gets jittery.
+#define RANGE_MEAS_VAR    9.0f     // (mm)^2; VL6180X close-range ~+/-3 mm
+
+// Reject any correction that disagrees with the current estimate by more
+// than this. Sweeping off the edge of the target produces a sudden step
+// of tens of mm - without this gate that step gets believed and yanks
+// position with it.
+#define RANGE_INNOV_MAX   40.0f    // mm
+
+// A hand crossing the beam looks exactly like sudden self-motion to the
+// anchor. These two guards tell them apart:
+//
+// RANGE_JUMP_MAX: the biggest believable change between consecutive
+// readings. Real hand/needle motion is smooth at 8-50 Hz; a hand
+// arriving in the beam is a step. Any single-sample jump larger than
+// this is a target change, not motion - freeze the correction and let
+// the reading re-settle before trusting it again.
+#define RANGE_JUMP_MAX    12.0f    // mm per sample
+
+// When the IMU says we are stationary, we KNOW the true innovation is
+// zero, so any nonzero range change must be the target moving (a hand).
+// While stationary we therefore do not correct at all - ZUPT already
+// holds position - and we re-baseline the anchor to the current reading
+// so that whatever the sensor sees at rest becomes the new zero. This is
+// what stops "block a sensor -> needle slides toward it".
+#define RANGE_TRUST_WHILE_MOVING_ONLY 1
+
+// A range change smaller than this per sample, while the IMU is also
+// stationary, counts as "not really moving" and re-baselines the anchor.
+// Anything larger is treated as real motion and gets corrected even if
+// the accelerometer is too insensitive to notice a slow creep. This is
+// the knob that decides how slow a motion the sensors will still track:
+// lower = tracks slower motion but re-baselines less aggressively at
+// rest; higher = holds a firmer zero at rest but ignores very slow
+// creeps. 1.5 mm at 8 Hz corresponds to about 12 mm/s.
+#define RANGE_CREEP_MM    1.5f
+
+// Dead-band: if a locked sensor's own range moves less than this between
+// samples, treat it as flat and apply NO correction from it - a flat
+// sensor only adds noise on its axis, which fights motion on the others.
+// This is the fix for "push forward on a surface and it resists": the
+// side sensor stays flat during a forward push and now stays quiet.
+// Set a hair above your range noise floor (VL6180X ~1 mm). Too high and
+// slow motion along that sensor's own axis gets ignored; too low and the
+// cross-coupling returns.
+#define RANGE_FLAT_MM     2.0f
+
+
+#define RANGE_REJECT_MAX  15       // consecutive rejects before re-anchoring
+#define RANGE_STABLE_MM   3.0f     // reading must be this steady to anchor
+
+// How long the reading must stay steady before anchoring. Anchoring no
+// longer waits for ZUPT: if the stationary detector never fires, the old
+// code would never anchor, so the correction silently never ran.
+#define RANGE_ANCHOR_MS   800UL
+
+/* --- BEAM DIRECTIONS, one per sensor, in the BODY frame ---------------
+ * NEW LAYOUT: the two sensors now point along different body axes, so
+ * they constrain two independent directions instead of one. A single
+ * rangefinder only ever pins the direction it looks along; two
+ * perpendicular ones pin two.
+ *
+ *   Sensor 1 -> body +X  ("right")
+ *   Sensor 2 -> body +Y  ("forward")
+ *
+ * "Body frame" means the IMU's own axes, which rotate with the syringe.
+ * At startup, with ZERO_YAW_AT_START on, the world X/Y axes are aligned
+ * to wherever the device is pointing then - so body +X maps to world +X
+ * and body +Y to world +Y while the device is roughly level and hasn't
+ * been turned. Tilt or yaw it and the code re-projects both beams into
+ * the world frame every sample, so the correction always lands on the
+ * right world axis regardless of pose.
+ *
+ * If you physically mount them the other way round (sensor 1 forward,
+ * sensor 2 right), just swap the two blocks below - nothing else changes.
+ * These must stay in sync with SENSOR1/2_LOCAL_DIR in the Slicer script.
+ * ------------------------------------------------------------------- */
+/* --- BEAM DIRECTIONS, in the BODY frame -------------------------------
+ * Module is LEVEL (gravity on Z, roll/pitch ~0). Earlier a tilt was
+ * diagnosed, but that was during the corrupted 2g-scale period and was
+ * almost certainly an artifact - with the scale fixed, orientation reads
+ * level, matching the actual mount. So we use the straightforward level
+ * mapping:  body +X = sideways,  +Y = forward (at phantom),  +Z = up.
+ *
+ * Physical aim, corrected empirically (2024 run): pushing toward the
+ * phantom moved channel 2's innov, not channel 1's - the mounting is the
+ * opposite of what this comment used to assume. Swapped:
+ *
+ *   sensor 1 -> sideways           = body +X.
+ *   sensor 2 -> phantom (forward)  = body +Y.
+ *
+ * rotateBodyToWorld() maps these to world axes each sample. If your own
+ * mount disagrees, re-verify the same way: push toward the phantom and
+ * channel 2's innov should move; push sideways and channel 1's should.
+ * ------------------------------------------------------------------- */
+#define BEAM1_BODY_X  1.0f      // sensor 1 -> +X (sideways)
+#define BEAM1_BODY_Y  0.0f
+#define BEAM1_BODY_Z  0.0f
+
+#define BEAM2_BODY_X  0.0f
+#define BEAM2_BODY_Y  1.0f      // sensor 2 -> +Y (forward, at phantom)
+#define BEAM2_BODY_Z  0.0f
+
+// Sensor 3 disconnected; left defined so the struct/serial stay intact.
+#define BEAM3_BODY_X  0.0f
+#define BEAM3_BODY_Y  0.0f
+#define BEAM3_BODY_Z  1.0f      // would be +Z (up) if reconnected
+
+// Sensor 4: points the OPPOSITE way to sensor 1 along X (i.e. body -X).
+// Together s1 (+X) and s4 (-X) form a differential pair: a leftward move
+// makes one beam's distance shrink while the other's grows by the same
+// amount, so combining them cancels common-mode error on the X axis.
+#define BEAM4_BODY_X -1.0f
+#define BEAM4_BODY_Y  0.0f
+#define BEAM4_BODY_Z  0.0f
+
+
+/* ---------------------------------------------------------------------
+ * Typedefs stay at the top: the Arduino IDE injects auto-generated
+ * prototypes near the top of the file, and any type used in a function
+ * signature must be visible before them.
+ * ------------------------------------------------------------------- */
+
+typedef struct __attribute__((packed))
+{
+    int16_t acc_x;
+    int16_t acc_y;
+    int16_t acc_z;
+    int16_t gyro_x;
+    int16_t gyro_y;
+    int16_t gyro_z;
+    int16_t roll;
+    int16_t pitch;
+    int16_t yaw;
+    uint8_t leve;
+    int16_t temp;
+    int16_t mag_x;
+    int16_t mag_y;
+    int16_t mag_z;
+} gy;
+
+typedef struct
+{
+    float q;
+    float r;
+    float x;
+    float p;
+    float k;
+} KalmanFilter;
+
+typedef struct
+{
+    float pos;
+    float vel;
+    float P[2][2];
+} PosVelKF;
+
+// One range-correction channel per sensor. Declared up here with the
+// other typedefs, NOT down beside the correction code, because the
+// Arduino IDE auto-generates function prototypes near the top of the
+// file - any type used in a signature (updateRangeChannel takes a
+// RangeChannel*) must be visible before those prototypes, or you get
+// "variable or field declared void" / "not declared in this scope".
+// state, published per channel to Slicer:
+//   0 no usable reading   1 waiting to anchor
+//   2 locked, correcting  3 reading rejected as an outlier
+typedef struct
+{
+    float bx, by, bz;              // beam direction in the body frame
+    bool  horizontal_only;         // true = flatten to XY; false = keep Z
+    bool  anchored;
+    float anchor_C;                // (position along beam + range) at anchor
+    float last_mm;
+    float prev_mm;                 // reading one sample ago, for jump test
+    float innov;                   // measurement minus estimate, mm
+    unsigned long stable_since_ms;
+    uint8_t reject_count;
+    uint8_t state;
+} RangeChannel;
+
+// Orientation EKF state. Defined up here with the other typedefs so the
+// Arduino IDE's auto-generated function prototypes (injected near the top
+// of the file) see the type before any ekf*() function that uses it -
+// otherwise the build fails with "OriEKF was not declared in this scope".
+typedef struct {
+    float q0, q1, q2, q3;      // quaternion
+    float bx, by, bz;          // gyro bias (rad/s)
+    float P[7][7];             // covariance
+    float Qg;                  // gyro process noise
+    float Qb;                  // bias random-walk noise
+    float Ra;                  // accel measurement noise
+    float Rm;                  // mag measurement noise
+    bool  inited;
+} OriEKF;
+
+gy my_95Q;
+VL6180X sensor1;
+VL6180X sensor2;
+VL6180X sensor3;
+VL6180X sensor4;
+
+unsigned int delay_t = 20;
+volatile byte ready_Ok = 0;
+volatile unsigned long int_count = 0;
+
+unsigned long i2c_fail_count = 0;
+unsigned long corrupt_count = 0;
+unsigned long sample_count = 0;
+unsigned long last_sample_ms = 0;
+unsigned long last_diag_ms = 0;
+unsigned long last_update_us = 0;
+unsigned long last_print_ms = 0;
+uint8_t extras_group = 0;        // which secondary group goes out this line
+
+// Latest accepted range readings, -1 when we have never had a valid one.
+float dist1_mm = -1.0f;
+float dist2_mm = -1.0f;
+float dist3_mm = -1.0f;
+float dist4_mm = -1.0f;
+int   dist1_raw = -1;
+int   dist2_raw = -1;
+bool  sensor1_present = false;
+bool  sensor2_present = false;
+bool  sensor3_present = false;
+bool  sensor4_present = false;
+
+/* ---------------- Scalar Kalman (output smoothing) ------------------ */
+
+void kalmanInit(KalmanFilter *kf, float process_noise, float measurement_noise, float initial_p)
+{
+    kf->q = process_noise;
+    kf->r = measurement_noise;
+    kf->x = 0.0f;
+    kf->p = initial_p;
+}
+
+float kalmanUpdate(KalmanFilter *kf, float measurement)
+{
+    kf->p = kf->p + kf->q;
+    kf->k = kf->p / (kf->p + kf->r);
+    kf->x = kf->x + kf->k * (measurement - kf->x);
+    kf->p = (1.0f - kf->k) * kf->p;
+    return kf->x;
+}
+
+KalmanFilter kf_acc_x, kf_acc_y, kf_acc_z;
+KalmanFilter kf_gyro_x, kf_gyro_y, kf_gyro_z;
+KalmanFilter kf_dist, kf_dist2, kf_dist3, kf_dist4;
+
+/* ---------------- Position / velocity filter ------------------------ */
+
+void posvelInit(PosVelKF *kf, float pos0, float vel0, float pos_var0, float vel_var0)
+{
+    kf->pos = pos0;
+    kf->vel = vel0;
+    kf->P[0][0] = pos_var0; kf->P[0][1] = 0.0f;
+    kf->P[1][0] = 0.0f;     kf->P[1][1] = vel_var0;
+}
+
+void posvelPredict(PosVelKF *kf, float accel, float dt, float q_accel_var)
+{
+    kf->pos += kf->vel * dt + 0.5f * accel * dt * dt;
+    kf->vel += accel * dt;
+
+    // Backstop against a corrupt sample that slips past the guard: a hand
+    // or needle never exceeds ~2 m/s. Clamp velocity to that, so a single
+    // bad acceleration cannot integrate position off to tens of metres
+    // (as seen when pz ran to -23000). Real motion is unaffected.
+    const float VEL_MAX_MMS = 2000.0f;   // 2 m/s
+    if (kf->vel >  VEL_MAX_MMS) kf->vel =  VEL_MAX_MMS;
+    if (kf->vel < -VEL_MAX_MMS) kf->vel = -VEL_MAX_MMS;
+
+    float dt2 = dt * dt;
+    float dt3 = dt2 * dt;
+    float dt4 = dt3 * dt;
+
+    float Qpp = 0.25f * dt4 * q_accel_var;
+    float Qpv = 0.5f  * dt3 * q_accel_var;
+    float Qvv = dt2 * q_accel_var;
+
+    float P00 = kf->P[0][0], P01 = kf->P[0][1];
+    float P10 = kf->P[1][0], P11 = kf->P[1][1];
+
+    kf->P[0][0] = P00 + dt * (P01 + P10) + dt2 * P11 + Qpp;
+    kf->P[0][1] = P01 + dt * P11 + Qpv;
+    kf->P[1][0] = P10 + dt * P11 + Qpv;
+    kf->P[1][1] = P11 + Qvv;
+}
+
+// THE STEP THAT WAS MISSING WITHOUT THE DISTANCE SENSORS.
+// Standard scalar measurement update for the 2-state filter, H = [1 0]:
+// an observation of position also corrects velocity, through the
+// position/velocity covariance the predict step has been building up.
+void posvelCorrect(PosVelKF *kf, float z_pos, float meas_var)
+{
+    float S  = kf->P[0][0] + meas_var;
+    if (S <= 0.0f) return;
+    float K0 = kf->P[0][0] / S;
+    float K1 = kf->P[1][0] / S;
+
+    float innov = z_pos - kf->pos;
+    kf->pos += K0 * innov;
+    kf->vel += K1 * innov;
+
+    float P00 = kf->P[0][0], P01 = kf->P[0][1];
+    float P10 = kf->P[1][0], P11 = kf->P[1][1];
+
+    kf->P[0][0] = P00 - K0 * P00;
+    kf->P[0][1] = P01 - K0 * P01;
+    kf->P[1][0] = P10 - K1 * P00;
+    kf->P[1][1] = P11 - K1 * P01;
+}
+
+void posvelZUPT(PosVelKF *kf, float vel_var_after_zupt)
+{
+    kf->vel = 0.0f;
+    kf->P[1][1] = vel_var_after_zupt;
+    kf->P[0][1] = 0.0f;
+    kf->P[1][0] = 0.0f;
+}
+
+void posvelLeak(PosVelKF *kf, float leak)
+{
+    kf->vel *= leak;
+}
+
+PosVelKF kf_pos_x, kf_pos_y, kf_pos_z;
+
+/* ================= ORIENTATION EKF (7-state) =========================
+ * State x = [ q0 q1 q2 q3  bx by bz ]
+ *   q = orientation quaternion (body -> world), bx/by/bz = gyro bias (rad/s)
+ *
+ * PREDICT: integrate the gyro (minus estimated bias) through the quaternion
+ *          kinematics - this is the nonlinear part an EKF exists to handle.
+ * CORRECT: two measurement updates -
+ *   (a) accelerometer gives the gravity direction -> corrects roll & pitch
+ *   (b) magnetometer gives the north direction   -> corrects yaw (absolute)
+ * The gyro-bias states let the filter learn and subtract drift, which is
+ * what actually sharpens fast-rotation tracking over time.
+ *
+ * Full 9-DOF as requested. Sized for the UNO: state 7, P is 7x7 (196 B),
+ * ~750 B working set total. Position stays in the separate linear KF.
+ *
+ * WHY ROLL/PITCH ONLY BY DEFAULT: (b) needs an absolute world reference
+ * for yaw, which the magnetometer is supposed to supply, but that only
+ * works once two separate problems are solved - see USE_EKF_MAG_YAW
+ * below. Until then the EKF corrects roll/pitch (the axes that decide
+ * how precisely the needle's ANGLE is tracked) and yaw is left to the
+ * GY-95T's own pre-fused output, same as before.
+ * ------------------------------------------------------------------- */
+#define USE_ORIENTATION_EKF 1   // ON: fuse gyro + accel into our own
+                                //  quaternion for roll/pitch. Continuous
+                                //  gravity-vector correction bounds the
+                                //  gyro-integration error that pure
+                                //  integration accumulates while the
+                                //  needle is held at an angle, and the
+                                //  bias states (bx/by/bz) let the filter
+                                //  learn and subtract the gyro's own
+                                //  steady-state drift over time - this is
+                                //  the actual fix for "moves at an angle,
+                                //  drifts, doesn't track precisely."
+
+// Whether the EKF ALSO corrects yaw from the magnetometer. OFF by default -
+// two real problems have to be solved first, not just left for later:
+//   1. FRAME MISMATCH. The mag correction assumes world +X is magnetic
+//      north. Everything else in this sketch (ZERO_YAW_AT_START,
+//      BEAM1/BEAM2_BODY_*) defines world axes as "wherever the device was
+//      pointing at power-on" - essentially never magnetic north. Turn mag
+//      yaw on without fixing this and the EKF spends every sample
+//      dragging yaw toward compass north while the range-correction beams
+//      stay wired to the power-on heading; the two disagree more the
+//      further apart those two directions happen to be.
+//   2. NO HARD/SOFT-IRON CALIBRATION. my_95Q.mag_x/y/z are raw. On a
+//      small board like this they are dominated by local anomalies
+//      (traces, nearby metal), not the earth's field, so an uncalibrated
+//      absolute yaw correction can inject more error than it removes.
+// Until both are solved, yaw is left alone: only roll/pitch - the axes
+// that actually decide needle-tilt precision - come from the EKF; yaw
+// keeps coming from the GY-95T's own pre-fused fusion (referencedYaw()),
+// same as when the EKF is off.
+#define USE_EKF_MAG_YAW      0
+
+OriEKF ekf;
+// EKF Euler output, published for the serial printer (which runs in a
+// separate function and can't see the update's locals).
+float g_ori_roll = 0, g_ori_pitch = 0, g_ori_yaw = 0;
+// Yaw value the EKF itself reported right after ekfSeedFromAccelMag() ran,
+// captured once so a later "zero yaw at start" subtraction stays inside
+// the EKF's OWN reference frame. yaw_ref_deg (below) is captured from the
+// GY-95T's separate internal fusion during calibrate() and lives in a
+// different frame (mag-referenced vs. whatever the module's fusion calls
+// zero) - subtracting one from the other produces a meaningless offset.
+// Only used if USE_EKF_MAG_YAW is ever turned on.
+float ekf_yaw_ref_deg = 0.0f;
+
+static void ekf_normalize(OriEKF *f)
+{
+    float n = sqrt(f->q0*f->q0 + f->q1*f->q1 + f->q2*f->q2 + f->q3*f->q3);
+    if (n > 1e-9f) { f->q0/=n; f->q1/=n; f->q2/=n; f->q3/=n; }
+}
+
+void ekfInit(OriEKF *f)
+{
+    f->q0 = 1; f->q1 = f->q2 = f->q3 = 0;
+    f->bx = f->by = f->bz = 0;
+    for (int i=0;i<7;i++) for (int j=0;j<7;j++) f->P[i][j] = 0;
+    for (int i=0;i<4;i++) f->P[i][i] = 0.01f;   // quat uncertainty
+    for (int i=4;i<7;i++) f->P[i][i] = 0.001f;  // bias uncertainty
+    f->Qg = 1e-4f;   // gyro process noise (tune)
+    f->Qb = 1e-7f;   // bias walk (tune)
+    f->Ra = 0.5f;    // accel trust (higher = trust gyro more)
+    f->Rm = 1.0f;    // mag trust (mag is noisier)
+    f->inited = true;
+}
+
+/* Seed the quaternion from the first accel+mag reading so we don't start
+ * 180 deg off and spend seconds converging. */
+void ekfSeedFromAccelMag(OriEKF *f, float ax, float ay, float az,
+                                    float mx, float my, float mz)
+{
+    // roll/pitch from gravity
+    float roll  = atan2(ay, az);
+    float pitch = atan2(-ax, sqrt(ay*ay + az*az));
+    // tilt-compensated heading from mag
+    float cr = cos(roll),  sr = sin(roll);
+    float cp = cos(pitch), sp = sin(pitch);
+    float mxh = mx*cp + my*sr*sp + mz*cr*sp;
+    float myh = my*cr - mz*sr;
+    float yaw = atan2(-myh, mxh);
+    // euler -> quaternion
+    float cy=cos(yaw*0.5f), sy=sin(yaw*0.5f);
+    float cpi=cos(pitch*0.5f), spi=sin(pitch*0.5f);
+    float crl=cos(roll*0.5f), srl=sin(roll*0.5f);
+    f->q0 = crl*cpi*cy + srl*spi*sy;
+    f->q1 = srl*cpi*cy - crl*spi*sy;
+    f->q2 = crl*spi*cy + srl*cpi*sy;
+    f->q3 = crl*cpi*sy - srl*spi*cy;
+    ekf_normalize(f);
+}
+
+/* PREDICT: propagate quaternion with bias-corrected gyro over dt. */
+void ekfPredict(OriEKF *f, float gx, float gy, float gz, float dt)
+{
+    // bias-corrected rates
+    float wx = gx - f->bx, wy = gy - f->by, wz = gz - f->bz;
+
+    // quaternion derivative qdot = 0.5 * q (x) w
+    float q0=f->q0,q1=f->q1,q2=f->q2,q3=f->q3;
+    float dq0 = 0.5f*(-q1*wx - q2*wy - q3*wz);
+    float dq1 = 0.5f*( q0*wx + q2*wz - q3*wy);
+    float dq2 = 0.5f*( q0*wy - q1*wz + q3*wx);
+    float dq3 = 0.5f*( q0*wz + q1*wy - q2*wx);
+    f->q0 += dq0*dt; f->q1 += dq1*dt; f->q2 += dq2*dt; f->q3 += dq3*dt;
+    ekf_normalize(f);
+
+    // Covariance predict: P = F P F^T + Q, with F ~ I + dF*dt.
+    // For the UNO we use a practical simplification: inflate the quaternion
+    // block by process noise and the bias block by random walk, plus the
+    // dominant cross terms. This keeps the filter stable and cheap without
+    // a full 7x7 Jacobian multiply every sample (which the 8-bit MCU can't
+    // afford at rate). This is a standard reduced-Jacobian EKF for MCUs.
+    for (int i=0;i<4;i++) f->P[i][i] += f->Qg + 0.25f*dt*dt*(
+                          f->P[4][4]+f->P[5][5]+f->P[6][6]);
+    for (int i=4;i<7;i++) f->P[i][i] += f->Qb;
+    // couple quat<->bias (gyro integrates bias into attitude)
+    for (int i=0;i<4;i++) for (int j=4;j<7;j++) {
+        f->P[i][j] += -0.5f*dt*f->P[j][j];
+        f->P[j][i] = f->P[i][j];
+    }
+}
+
+/* CORRECT with a unit reference vector (accel=gravity or mag=north).
+ * Measures the direction the body should see and nudges the quaternion so
+ * the predicted direction matches the measured one. Scalar-per-axis update
+ * keeps the math within the UNO's budget. */
+static void ekfCorrectVector(OriEKF *f,
+                             float mxb, float myb, float mzb,   // measured (body)
+                             float rxw, float ryw, float rzw,   // reference (world)
+                             float R)
+{
+    // normalize measurement
+    float n = sqrt(mxb*mxb+myb*myb+mzb*mzb);
+    if (n < 1e-6f) return;
+    mxb/=n; myb/=n; mzb/=n;
+
+    // rotate world reference into body frame using current quaternion
+    float q0=f->q0,q1=f->q1,q2=f->q2,q3=f->q3;
+    // R_wb = transpose of body->world
+    float ex = (1-2*(q2*q2+q3*q3))*rxw + 2*(q1*q2+q0*q3)*ryw + 2*(q1*q3-q0*q2)*rzw;
+    float ey = 2*(q1*q2-q0*q3)*rxw + (1-2*(q1*q1+q3*q3))*ryw + 2*(q2*q3+q0*q1)*rzw;
+    float ez = 2*(q1*q3+q0*q2)*rxw + 2*(q2*q3-q0*q1)*ryw + (1-2*(q1*q1+q2*q2))*rzw;
+
+    // innovation = measured (body) - predicted (body), as a small rotation
+    // (cross product gives the axis/angle error)
+    float errx = myb*ez - mzb*ey;
+    float erry = mzb*ex - mxb*ez;
+    float errz = mxb*ey - myb*ex;
+
+    // gain: pull quaternion vector part toward correcting the error.
+    // Scalar Kalman-style gain per axis from the quaternion covariance.
+    float Pq = (f->P[1][1]+f->P[2][2]+f->P[3][3]) / 3.0f;
+    float K = Pq / (Pq + R);
+
+    // apply correction as a small quaternion nudge
+    float cx = 0.5f*K*errx, cy = 0.5f*K*erry, cz = 0.5f*K*errz;
+    float nq0 = q0 - (q1*cx + q2*cy + q3*cz);
+    float nq1 = q1 + (q0*cx + q2*cz - q3*cy);
+    float nq2 = q2 + (q0*cy - q1*cz + q3*cx);
+    float nq3 = q3 + (q0*cz + q1*cy - q2*cx);
+    f->q0=nq0; f->q1=nq1; f->q2=nq2; f->q3=nq3;
+    ekf_normalize(f);
+
+    // feed a little of the error into the bias estimate (drift learning)
+    f->bx += 1e-3f*K*errx;
+    f->by += 1e-3f*K*erry;
+    f->bz += 1e-3f*K*errz;
+
+    // shrink covariance
+    for (int i=1;i<4;i++) f->P[i][i] *= (1.0f - K);
+}
+
+/* Read the EKF out as Euler angles (deg) for display + the world-frame
+ * rotation the position pipeline needs. */
+void ekfEuler(OriEKF *f, float *roll_deg, float *pitch_deg, float *yaw_deg)
+{
+    float q0=f->q0,q1=f->q1,q2=f->q2,q3=f->q3;
+    *roll_deg  = atan2(2*(q0*q1+q2*q3), 1-2*(q1*q1+q2*q2)) * 57.29578f;
+    *pitch_deg = asin( 2*(q0*q2-q3*q1)) * 57.29578f;
+    *yaw_deg   = atan2(2*(q0*q3+q1*q2), 1-2*(q2*q2+q3*q3)) * 57.29578f;
+}
+
+/* ---------------- Stationary detector ------------------------------- */
+
+float acc_hist[STAT_WIN];
+float gyr_hist[STAT_WIN];
+uint8_t hist_i = 0;
+uint8_t hist_n = 0;
+
+float tol_acc_offset = 0.02f;
+float tol_acc_std    = 0.01f;
+float tol_gyro       = 5.0f;
+
+void statPush(float acc_mag_g, float gyro_mag_dps)
+{
+    acc_hist[hist_i] = acc_mag_g;
+    gyr_hist[hist_i] = gyro_mag_dps;
+    hist_i = (hist_i + 1) % STAT_WIN;
+    if (hist_n < STAT_WIN) hist_n++;
+}
+
+bool statIsStationary()
+{
+    if (hist_n < STAT_WIN) return false;
+
+    float mean_a = 0.0f, mean_g = 0.0f;
+    for (uint8_t i = 0; i < STAT_WIN; i++) { mean_a += acc_hist[i]; mean_g += gyr_hist[i]; }
+    mean_a /= STAT_WIN;
+    mean_g /= STAT_WIN;
+
+    float var_a = 0.0f;
+    for (uint8_t i = 0; i < STAT_WIN; i++) {
+        float d = acc_hist[i] - mean_a;
+        var_a += d * d;
+    }
+    var_a /= STAT_WIN;
+
+    return (fabs(mean_a - 1.0f) < tol_acc_offset)
+        && (sqrt(var_a)        < tol_acc_std)
+        && (mean_g             < tol_gyro);
+}
+
+/* ---------------- World frame --------------------------------------- */
+
+float acc_bias_world_x = 0.0f;
+float acc_bias_world_y = 0.0f;
+float acc_bias_world_z = 0.0f;
+
+// Multiplicative correction on every accel reading, measured at startup.
+float acc_gain = 1.0f;
+
+float yaw_ref_deg = 0.0f;
+unsigned long stationary_since_ms = 0;
+
+// Instances live here (after the BEAM_* macros they initialise from).
+RangeChannel ch1 = {BEAM1_BODY_X, BEAM1_BODY_Y, BEAM1_BODY_Z,
+                    true,  false, 0.0f, -1.0f, -1.0f, 0.0f, 0, 0, 0};
+RangeChannel ch2 = {BEAM2_BODY_X, BEAM2_BODY_Y, BEAM2_BODY_Z,
+                    true,  false, 0.0f, -1.0f, -1.0f, 0.0f, 0, 0, 0};
+RangeChannel ch3 = {BEAM3_BODY_X, BEAM3_BODY_Y, BEAM3_BODY_Z,
+                    false, false, 0.0f, -1.0f, -1.0f, 0.0f, 0, 0, 0};
+RangeChannel ch4 = {BEAM4_BODY_X, BEAM4_BODY_Y, BEAM4_BODY_Z,
+                    true,  false, 0.0f, -1.0f, -1.0f, 0.0f, 0, 0, 0};
+
+float referencedYaw()
+{
+#if ZERO_YAW_AT_START
+    return (my_95Q.yaw / 100.0f) - yaw_ref_deg;
+#else
+    return my_95Q.yaw / 100.0f;
+#endif
+}
+
+void rotateBodyToWorld(float ax, float ay, float az,
+                       float roll_deg, float pitch_deg, float yaw_deg,
+                       float *wx, float *wy, float *wz)
+{
+    float roll  = roll_deg  * 0.017453293f;
+    float pitch = pitch_deg * 0.017453293f;
+    float yaw   = yaw_deg   * 0.017453293f;
+
+    float cr = cos(roll),  sr = sin(roll);
+    float cp = cos(pitch), sp = sin(pitch);
+    float cy = cos(yaw),   sy = sin(yaw);
+
+    *wx = (cy*cp)*ax + (cy*sp*sr - sy*cr)*ay + (cy*sp*cr + sy*sr)*az;
+    *wy = (sy*cp)*ax + (sy*sp*sr + cy*cr)*ay + (sy*sp*cr - cy*sr)*az;
+    *wz = (-sp)*ax   + (cp*sr)*ay            + (cp*cr)*az;
+}
+
+/* ---------------- VL6180X, non-blocking ------------------------------
+ * Register numbers are written as literals rather than library enum
+ * names so this compiles against any version of the Pololu library.
+ *   0x4F  RESULT__INTERRUPT_STATUS_GPIO
+ *   0x4D  RESULT__RANGE_STATUS
+ *   0x62  RESULT__RANGE_VAL
+ *   0x15  SYSTEM__INTERRUPT_CLEAR
+ * ------------------------------------------------------------------- */
+
+// Returns true and fills out_mm only when a fresh sample is waiting.
+// Never waits for a conversion to finish.
+bool rangePoll(VL6180X &s, int *out_mm)
+{
+    uint8_t status = s.readReg(0x4F);
+    if ((status & 0x07) != 0x04) return false;      // no new sample yet
+
+    uint8_t err = s.readReg(0x4D) >> 4;             // 0 = valid measurement
+    uint8_t mm  = s.readReg(0x62);
+    s.writeReg(0x15, 0x01);                         // clear the interrupt
+
+    if (err != 0 || mm == 255 || mm > RANGE_MAX_VALID) {
+        *out_mm = -1;
+        return true;                                // fresh, but unusable
+    }
+    *out_mm = (int)mm;
+    return true;
+}
+
+void serviceRangeSensors()
+{
+    int mm;
+    if (sensor1_present && rangePoll(sensor1, &mm)) {
+        dist1_raw = mm;
+        dist1_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist, (float)mm);
+    }
+    if (sensor2_present && rangePoll(sensor2, &mm)) {
+        dist2_raw = mm;
+        dist2_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist2, (float)mm);
+    }
+    if (sensor3_present && rangePoll(sensor3, &mm)) {
+        dist3_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist3, (float)mm);
+    }
+    if (sensor4_present && rangePoll(sensor4, &mm)) {
+        dist4_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist4, (float)mm);
+    }
+}
+
+void setupRangeSensors()
+{
+    pinMode(SENSOR1_SHUT_PIN, OUTPUT);
+    pinMode(SENSOR2_SHUT_PIN, OUTPUT);
+    pinMode(SENSOR3_SHUT_PIN, OUTPUT);
+    pinMode(SENSOR4_SHUT_PIN, OUTPUT);
+
+    // All power up at 0x29, so only one may be awake at a time until it has
+    // been given a unique address. Hold all in reset, then bring them up one
+    // by one: sensor 4 (0x32), sensor 3 (0x31), sensor 2 (0x30), then sensor
+    // 1 last (keeps the default 0x29).
+    digitalWrite(SENSOR1_SHUT_PIN, LOW);
+    digitalWrite(SENSOR2_SHUT_PIN, LOW);
+    digitalWrite(SENSOR3_SHUT_PIN, LOW);
+    digitalWrite(SENSOR4_SHUT_PIN, LOW);
+    delay(20);
+
+    digitalWrite(SENSOR4_SHUT_PIN, HIGH);
+    delay(20);
+    sensor4.setTimeout(200);
+    sensor4.init();
+    sensor4.configureDefault();
+    sensor4.setScaling(RANGE_SCALING);
+    sensor4.setAddress(SENSOR4_ADDRESS);
+    sensor4_present = !sensor4.timeoutOccurred();
+
+    digitalWrite(SENSOR3_SHUT_PIN, HIGH);
+    delay(20);
+    sensor3.setTimeout(200);
+    sensor3.init();
+    sensor3.configureDefault();
+    sensor3.setScaling(RANGE_SCALING);
+    sensor3.setAddress(SENSOR3_ADDRESS);
+    sensor3_present = !sensor3.timeoutOccurred();
+
+    digitalWrite(SENSOR2_SHUT_PIN, HIGH);
+    delay(20);
+    sensor2.setTimeout(200);
+    sensor2.init();
+    sensor2.configureDefault();
+    sensor2.setScaling(RANGE_SCALING);
+    sensor2.setAddress(SENSOR2_ADDRESS);
+    sensor2_present = !sensor2.timeoutOccurred();
+
+    digitalWrite(SENSOR1_SHUT_PIN, HIGH);
+    delay(20);
+    sensor1.setTimeout(200);
+    sensor1.init();
+    sensor1.configureDefault();
+    sensor1.setScaling(RANGE_SCALING);
+    sensor1_present = !sensor1.timeoutOccurred();
+
+    // Continuous mode: the sensors range on their own schedule and we
+    // collect whatever is ready. No blocking waits in the main loop.
+    if (sensor1_present) sensor1.startRangeContinuous(RANGE_PERIOD_MS);
+    if (sensor2_present) sensor2.startRangeContinuous(RANGE_PERIOD_MS);
+    if (sensor3_present) sensor3.startRangeContinuous(RANGE_PERIOD_MS);
+    if (sensor4_present) sensor4.startRangeContinuous(RANGE_PERIOD_MS);
+
+#if VERBOSE_STARTUP
+    Serial.print(F("# VL6180X s1="));
+    Serial.print(sensor1_present ? F("ok") : F("MISSING"));
+    Serial.print(F(" s2="));
+    Serial.print(sensor2_present ? F("ok") : F("MISSING"));
+    Serial.print(F(" s3="));
+    Serial.print(sensor3_present ? F("ok") : F("MISSING"));
+    Serial.print(F(" s4="));
+    Serial.println(sensor4_present ? F("ok") : F("MISSING"));
+    if (!sensor1_present || !sensor2_present || !sensor3_present || !sensor4_present) {
+        Serial.println(F("# Check SHUT pins 4/5/6/7, power, and the bus."));
+    }
+#endif
+}
+
+/* ---------------- Range-aided position correction ------------------- */
+
+#if USE_RANGE_CORRECTION
+
+// Correct one axis given the beam's component along it. This is the
+// standard Kalman update for a measurement of a PROJECTION of position,
+// H = [ux 0 uy 0 uz 0], split across three independent per-axis filters.
+// A single joint 6-state filter would also build cross-axis covariance;
+// we ignore that, which is the usual pragmatic simplification and costs
+// little when the beam is close to one axis.
+void correctAxisAlongBeam(PosVelKF *kf, float u, float innov, float S)
+{
+    if (u == 0.0f || S <= 0.0f) return;
+
+    float K0 = kf->P[0][0] * u / S;
+    float K1 = kf->P[1][0] * u / S;
+
+    kf->pos += K0 * innov;
+    kf->vel += K1 * innov;      // correcting position corrects velocity too
+
+    float HP0 = u * kf->P[0][0];
+    float HP1 = u * kf->P[0][1];
+    kf->P[0][0] -= K0 * HP0;
+    kf->P[0][1] -= K0 * HP1;
+    kf->P[1][0] -= K1 * HP0;
+    kf->P[1][1] -= K1 * HP1;
+}
+
+// Anchor, gate and apply one channel along its own beam.
+// `stationary` comes from the IMU. When true we trust the accelerometer's
+// verdict (no motion) over the rangefinder, because a range change while
+// physically still can only be the target moving - e.g. a hand.
+void updateRangeChannel(RangeChannel *ch, float ux, float uy, float uz,
+                        float d, bool stationary)
+{
+    // Horizontal sensors (X, Y) get their vertical leakage removed so a
+    // tilt cannot bleed their correction into Z. The vertical sensor is
+    // exempt - correcting Z is its whole job.
+    if (ch->horizontal_only) {
+        uz = 0.0f;
+        float hmag = sqrt(ux*ux + uy*uy);
+        if (hmag < 0.3f) { ch->state = 0; return; }  // too vertical to use
+        ux /= hmag; uy /= hmag;
+    } else {
+        // Vertical channel: strip any horizontal leakage instead, so a
+        // tilt cannot bleed the up-sensor into X or Y. Bail if the beam
+        // has tilted too far from vertical to mean anything.
+        ux = 0.0f; uy = 0.0f;
+        float vmag = fabs(uz);
+        if (vmag < 0.3f) { ch->state = 0; return; }  // too horizontal to use
+        uz = (uz > 0.0f) ? 1.0f : -1.0f;
+    }
+
+    float p_along = kf_pos_x.pos * ux + kf_pos_y.pos * uy + kf_pos_z.pos * uz;
+
+    // --- Jump guard: a hand entering the beam is a step, not motion. ---
+    // Real motion changes the range smoothly between samples. A single
+    // large jump means the target itself changed, so freeze this channel
+    // and let the reading settle rather than believing the step.
+    if (ch->prev_mm >= 0.0f && fabs(d - ch->prev_mm) > RANGE_JUMP_MAX) {
+        ch->prev_mm = d;
+        ch->state = 3;             // rejected: target jumped
+        // A jump also invalidates the surface we anchored to - re-anchor.
+        ch->anchored = false;
+        ch->stable_since_ms = 0;
+        return;
+    }
+    ch->prev_mm = d;
+
+    if (!ch->anchored) {
+        if (ch->last_mm < 0.0f || fabs(d - ch->last_mm) > RANGE_STABLE_MM) {
+            ch->stable_since_ms = 0;
+        } else if (ch->stable_since_ms == 0) {
+            ch->stable_since_ms = millis();
+        }
+        ch->last_mm = d;
+
+        if (ch->stable_since_ms == 0
+            || millis() - ch->stable_since_ms < RANGE_ANCHOR_MS) {
+            ch->state = 1;
+            return;
+        }
+
+        ch->anchor_C = p_along + d;
+        ch->anchored = true;
+        ch->reject_count = 0;
+    }
+    ch->last_mm = d;
+
+    ch->innov = (ch->anchor_C - d) - p_along;
+
+    // --- Anti-occlusion guard: re-baseline instead of correcting ----------
+    // A range change while the IMU insists we are NOT moving can only be
+    // the target changing (a hand, tissue, whatever entered the beam), not
+    // real motion. Without this, that change gets applied as a position
+    // correction and the needle visibly slides toward whatever just
+    // blocked the sensor - even after ZUPT has zeroed velocity, because
+    // ZUPT does not touch position and runs AFTER this correction anyway.
+    //
+    // This is deliberately narrower than "never correct while stationary":
+    // a slow forward push produces almost no acceleration, so the IMU
+    // still reports stationary, and rebaselining on every sample in that
+    // case would make the push invisible (the sensor watches you approach
+    // while the code keeps calling the new distance "zero"). RANGE_CREEP_MM
+    // is what tells the two apart - bigger than that per sample, and it
+    // gets corrected even though the IMU calls it stationary.
+#if RANGE_TRUST_WHILE_MOVING_ONLY
+    float creep = fabs(d - ch->prev_mm);
+    if (stationary && creep < RANGE_CREEP_MM) {
+        ch->anchor_C = p_along + d;   // truly still: adopt reading as zero
+        ch->innov = 0.0f;
+        ch->state = 2;
+        ch->reject_count = 0;
+        return;
+    }
+#endif
+
+    // --- Apply only when the innovation is above the noise floor ---------
+    // innov is the accumulated disagreement between what the range sensor
+    // measures and what the position estimate predicts, measured from the
+    // STABLE anchor set at lock time. It is allowed to GROW across samples,
+    // so even a slow push (small change per sample) eventually clears the
+    // floor and gets corrected. The anchor is NOT reset here - resetting it
+    // when the reading looked flat was the bug that pinned innov at 0 and
+    // made forward motion invisible.
+    if (fabs(ch->innov) < RANGE_FLAT_MM) {
+        ch->state = 2;                // locked, idle (below noise floor)
+        ch->reject_count = 0;
+        return;
+    }
+
+    // Outlier gate: an innovation this large means the surface premise
+    // broke (edge crossing, target moved, or a jump). Reject it; if it
+    // persists, the old anchor is stale so adopt the current reading.
+    if (fabs(ch->innov) > RANGE_INNOV_MAX) {
+        ch->state = 3;
+        if (++ch->reject_count > RANGE_REJECT_MAX) {
+            ch->anchor_C = p_along + d;      // stale reference; adopt current
+            ch->reject_count = 0;
+        }
+        return;
+    }
+    ch->reject_count = 0;
+
+    float S = ux * ux * kf_pos_x.P[0][0]
+            + uy * uy * kf_pos_y.P[0][0]
+            + uz * uz * kf_pos_z.P[0][0]
+            + RANGE_MEAS_VAR;
+
+    correctAxisAlongBeam(&kf_pos_x, ux, ch->innov, S);
+    correctAxisAlongBeam(&kf_pos_y, uy, ch->innov, S);
+    correctAxisAlongBeam(&kf_pos_z, uz, ch->innov, S);
+    ch->state = 2;
+}
+
+void resetChannel(RangeChannel *ch)
+{
+    ch->state = 0;
+    ch->anchored = false;
+    ch->stable_since_ms = 0;
+    ch->last_mm = -1.0f;
+    ch->prev_mm = -1.0f;
+}
+
+// roll_deg/pitch_deg/yaw_deg: the FUSED orientation to rotate each beam by.
+// Callers pass ori_roll/ori_pitch/ori_yaw (the EKF's roll/pitch when
+// USE_ORIENTATION_EKF is on, the GY-95T's own fusion otherwise) - NOT
+// my_95Q.roll/pitch directly, so any orientation-precision improvement
+// (the EKF) actually reaches the beams that project range readings onto
+// world axes. Previously this read my_95Q.roll/pitch unconditionally, so
+// enabling the EKF improved the *dead-reckoned* position but left the
+// range-aided correction itself keyed to the old, drift-prone angles.
+void applyRangeCorrection(bool is_stationary,
+                          float roll_deg, float pitch_deg, float yaw_deg)
+{
+    // Rotate each beam from the body frame into the world frame using the
+    // current fused orientation. This keeps every correction landing on
+    // the right world axis even as the syringe tilts and turns.
+    float u1x, u1y, u1z, u2x, u2y, u2z, u3x, u3y, u3z;
+    rotateBodyToWorld(ch1.bx, ch1.by, ch1.bz,
+                      roll_deg, pitch_deg, yaw_deg, &u1x, &u1y, &u1z);
+    rotateBodyToWorld(ch2.bx, ch2.by, ch2.bz,
+                      roll_deg, pitch_deg, yaw_deg, &u2x, &u2y, &u2z);
+    rotateBodyToWorld(ch3.bx, ch3.by, ch3.bz,
+                      roll_deg, pitch_deg, yaw_deg, &u3x, &u3y, &u3z);
+    float u4x, u4y, u4z;
+    rotateBodyToWorld(ch4.bx, ch4.by, ch4.bz,
+                      roll_deg, pitch_deg, yaw_deg, &u4x, &u4y, &u4z);
+
+    // --- X-axis differential pair: sensor 1 (+X) and sensor 4 (-X) --------
+    // They face opposite ways, so a leftward move shrinks one beam's range
+    // and grows the other's by the same amount. Both channels correct the
+    // SAME world X axis (updateRangeChannel projects each beam onto its own
+    // axis, and here both project onto X), so applying both when valid lets
+    // their independent noise average out - a true differential measurement
+    // that cancels error common to both. When only one sees a surface, that
+    // one still corrects alone (redundancy / blind-spot coverage).
+    if (dist1_mm >= 0.0f) updateRangeChannel(&ch1, u1x, u1y, u1z, dist1_mm, is_stationary);
+    else                  resetChannel(&ch1);
+
+    if (dist4_mm >= 0.0f) updateRangeChannel(&ch4, u4x, u4y, u4z, dist4_mm, is_stationary);
+    else                  resetChannel(&ch4);
+
+    if (dist2_mm >= 0.0f) updateRangeChannel(&ch2, u2x, u2y, u2z, dist2_mm, is_stationary);
+    else                  resetChannel(&ch2);
+
+    if (dist3_mm >= 0.0f) updateRangeChannel(&ch3, u3x, u3y, u3z, dist3_mm, is_stationary);
+    else                  resetChannel(&ch3);
+}
+#endif  // USE_RANGE_CORRECTION
+
+/* ---------------- Sample acquisition -------------------------------- */
+
+bool sampleReady()
+{
+    if (ready_Ok) {
+        ready_Ok = 0;
+        return true;
+    }
+#if USE_POLL_FALLBACK
+    if (millis() - last_sample_ms >= (unsigned long)(delay_t)) return true;
+#endif
+    return false;
+}
+
+// Reject a sample whose contents are physically impossible - the
+// signature of a corrupted I2C read on a marginal bus (floating lines,
+// loose breadboard jumpers). Seen in captures: roll/pitch/yaw snapping to
+// exactly 0.0 mid-motion, magnetometer jumping to thousands, accel
+// magnitude collapsing to ~0.5 g. Integrating even one such sample throws
+// position metres off. This is a SEATBELT, not a fix - proper pull-up
+// resistors on SDA/SCL are the real cure - but it stops one bad read from
+// destroying the whole track.
+// Guard ON, but only the SAFE checks. Last time it rejected good data
+// because the accel/mag bounds were too tight; those are now widened and,
+// more importantly, the PRIMARY check is the one that never false-fires:
+// roll==pitch==yaw==EXACTLY 0.0, which real fused output never produces
+// but a corrupt I2C read does (seen repeatedly in captures, right before
+// pz explodes). This alone stops the runaway that has wrecked every long
+// capture. The accel/mag checks are backups with generous bounds.
+#define USE_CORRUPTION_GUARD 1
+
+// When the guard is on, this records why the last rejection happened:
+//   1 orientation exactly 0/0/0   2 accel magnitude out of band
+//   3 magnetometer out of envelope
+uint8_t corrupt_reason = 0;
+
+bool sampleLooksCorrupt()
+{
+#if !USE_CORRUPTION_GUARD
+    return false;                       // guard disabled
+#else
+    // 1. Orientation exactly zero on all three axes.
+    if (my_95Q.roll == 0 && my_95Q.pitch == 0 && my_95Q.yaw == 0) {
+        corrupt_reason = 1; return true;
+    }
+
+    // 2. Accel magnitude far from 1 g. Wide band so brisk motion is fine.
+    float ax = my_95Q.acc_x * ACC_SCALE;
+    float ay = my_95Q.acc_y * ACC_SCALE;
+    float az = my_95Q.acc_z * ACC_SCALE;
+    float amag = sqrt(ax*ax + ay*ay + az*az);
+    if (amag < 0.4f || amag > 3.0f) {   // widened from 0.5-2.5
+        corrupt_reason = 2; return true;
+    }
+
+    // 3. Magnetometer wildly out of envelope.
+    if (abs(my_95Q.mag_x) > 5000 || abs(my_95Q.mag_y) > 5000
+        || abs(my_95Q.mag_z) > 5000) {  // widened from 3000
+        corrupt_reason = 3; return true;
+    }
+
+    return false;
+#endif
+}
+
+bool readIMU()
+{
+    unsigned char data[27] = {0};
+    if (!iic_read(0x08, data, 27)) {
+        i2c_fail_count++;
+        return false;
+    }
+    memcpy(&my_95Q, data, 27);
+
+    if (sampleLooksCorrupt()) {
+        corrupt_count++;
+        // Do NOT update last_sample_ms/sample_count or integrate: treat it
+        // as if the sample never arrived. The filter simply pauses for this
+        // frame and resumes on the next clean one.
+        return false;
+    }
+
+    last_sample_ms = millis();
+    sample_count++;
+    return true;
+}
+
+// Single-character commands, typed into the Serial Monitor:
+//   a = drop the anchor and re-establish it here
+//   z = zero position and velocity
+void serviceSerialCommands()
+{
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == 'a' || c == 'A') {
+            resetChannel(&ch1);
+            resetChannel(&ch2);
+            resetChannel(&ch3);
+            resetChannel(&ch4);
+#if VERBOSE_STARTUP
+            Serial.println(F("# Re-anchoring range reference..."));
+#endif
+        } else if (c == 'z' || c == 'Z') {
+            posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
+            posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
+            posvelInit(&kf_pos_z, 0.0f, 0.0f, 1.0f, 1.0f);
+            resetChannel(&ch1);
+            resetChannel(&ch2);
+            resetChannel(&ch3);
+            resetChannel(&ch4);
+#if VERBOSE_STARTUP
+            Serial.println(F("# Position zeroed."));
+#endif
+        }
+    }
+}
+
+void serviceDiagnostics()
+{
+#if VERBOSE_STARTUP
+    unsigned long now = millis();
+    if (now - last_diag_ms < DIAG_PERIOD_MS) return;
+    last_diag_ms = now;
+
+    // If corrupt samples are being rejected, report the rate - this is the
+    // live readout of bus health. A nonzero count means the guard is
+    // catching bad I2C reads; a rising count means add pull-up resistors.
+    if (corrupt_count > 0) {
+        Serial.print(F("# rejected "));
+        Serial.print(corrupt_count);
+        Serial.print(F(" corrupt samples (last reason="));
+        Serial.print(corrupt_reason);
+        Serial.print(F(") in last "));
+        Serial.print(DIAG_PERIOD_MS / 1000);
+        Serial.println(F("s"));
+        corrupt_count = 0;
+    }
+
+    if (sample_count > 0) { sample_count = 0; return; }
+
+    Serial.print(F("# NO DATA. int_fires="));
+    Serial.print(int_count);
+    Serial.print(F(" i2c_fails="));
+    Serial.print(i2c_fail_count);
+    if (int_count == 0) Serial.print(F("  -> data-ready pin is not reaching D2"));
+    else if (i2c_fail_count > 0) Serial.print(F("  -> I2C reads failing: check SDA/SCL, pull-ups, address"));
+    Serial.println();
+    i2c_fail_count = 0;
+#endif
+}
+
+/* ---------------- Startup calibration ------------------------------- */
+
+void calibrate()
+{
+#if VERBOSE_STARTUP
+    Serial.println(F("# Calibrating - hold the device COMPLETELY still..."));
+#endif
+
+    int   collected = 0;
+    float sum_wx = 0, sum_wy = 0, sum_wz = 0;
+    float sum_am = 0, sum_am2 = 0;
+    float sum_gm = 0, sum_gm2 = 0;
+    unsigned long cal_start = millis();
+
+    while (collected < CAL_SAMPLES && millis() - cal_start < 8000UL) {
+        if (!sampleReady()) continue;
+        if (!readIMU())     continue;
+
+        if (collected == 0) yaw_ref_deg = my_95Q.yaw / 100.0f;
+
+        float ax_g = my_95Q.acc_x * ACC_SCALE;
+        float ay_g = my_95Q.acc_y * ACC_SCALE;
+        float az_g = my_95Q.acc_z * ACC_SCALE;
+
+        float wx, wy, wz;
+        rotateBodyToWorld(ax_g, ay_g, az_g,
+                          my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
+                          referencedYaw(), &wx, &wy, &wz);
+
+        sum_wx += wx; sum_wy += wy; sum_wz += wz;
+
+        float am = sqrt(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+        sum_am += am; sum_am2 += am * am;
+
+        float gx  = my_95Q.gyro_x * GYRO_SCALE;
+        float gy_ = my_95Q.gyro_y * GYRO_SCALE;
+        float gz  = my_95Q.gyro_z * GYRO_SCALE;
+        float gm  = sqrt(gx*gx + gy_*gy_ + gz*gz);
+        sum_gm += gm; sum_gm2 += gm * gm;
+
+        collected++;
+    }
+
+    sample_count = 0;
+
+    if (collected < 20) {
+#if VERBOSE_STARTUP
+        Serial.print(F("# CALIBRATION FAILED. samples=")); Serial.print(collected);
+        Serial.print(F(" int_fires=")); Serial.print(int_count);
+        Serial.print(F(" i2c_fails=")); Serial.println(i2c_fail_count);
+        Serial.println(F("# Running anyway with zero bias."));
+#endif
+        return;
+    }
+
+    float n = (float)collected;
+
+    float mean_am = sum_am / n;
+    float std_am  = sqrt(fmax(0.0f, sum_am2 / n - mean_am * mean_am));
+    float mean_gm = sum_gm / n;
+    float std_gm  = sqrt(fmax(0.0f, sum_gm2 / n - mean_gm * mean_gm));
+
+    // Scale correction first: at rest |a| must be exactly 1g, so the
+    // factor that makes it so is the true scale error. This has to come
+    // before the bias, because bias is what is left AFTER scaling.
+    if (mean_am > 0.5f && mean_am < 1.5f) {
+        acc_gain = 1.0f / mean_am;
+        if (acc_gain < ACC_GAIN_MIN) acc_gain = ACC_GAIN_MIN;
+        if (acc_gain > ACC_GAIN_MAX) acc_gain = ACC_GAIN_MAX;
+    }
+
+    // Sums were accumulated ungained; rotation is linear, so scaling the
+    // averages afterwards is equivalent to having scaled every sample.
+    acc_bias_world_x = (sum_wx / n) * acc_gain * ACC_G_TO_MMS2;
+    acc_bias_world_y = (sum_wy / n) * acc_gain * ACC_G_TO_MMS2;
+    acc_bias_world_z = ((sum_wz / n) * acc_gain - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
+
+    std_am *= acc_gain;
+    tol_acc_std    = fmax(3.0f * std_am, 0.003f);
+    tol_acc_offset = fmax(6.0f * std_am, 0.012f);
+    tol_gyro       = fmax(mean_gm + 6.0f * std_gm, 3.0f);
+
+#if VERBOSE_STARTUP
+    Serial.print(F("# OK samples=")); Serial.println(collected);
+    Serial.print(F("# Accel scale gain=")); Serial.print(acc_gain, 5);
+    Serial.print(F("  (raw |a| was ")); Serial.print(mean_am, 5);
+    Serial.println(F(" g at rest; 1.00000 would be perfect)"));
+    Serial.print(F("# Bias mm/s^2 x=")); Serial.print(acc_bias_world_x, 2);
+    Serial.print(F(" y=")); Serial.print(acc_bias_world_y, 2);
+    Serial.print(F(" z=")); Serial.println(acc_bias_world_z, 2);
+    Serial.print(F("# ZUPT acc_off<")); Serial.print(tol_acc_offset, 4);
+    Serial.print(F(" acc_std<")); Serial.print(tol_acc_std, 4);
+    Serial.print(F(" gyro<")); Serial.println(tol_gyro, 3);
+#endif
+}
+
+/* ---------------- setup / loop -------------------------------------- */
+
+void setup()
+{
+    Serial.begin(SERIAL_BAUD);
+    delay(400);
+
+    Wire.begin();
+    Wire.setClock(I2C_CLOCK_HZ);
+    delay(100);
+
+    // Command the IMU to its fastest internal refresh (register 0x02):
+    // 0=10Hz 1=50Hz 2=100Hz 3=200Hz. We want 200Hz so the chip recomputes
+    // orientation fast enough to capture quick rotations - the finer
+    // temporal detail we're after comes from HERE (more angle updates per
+    // second at the source), not from a fancier downstream filter.
+    // NOTE: this setting may not persist a full power cycle, so we write it
+    // every startup rather than assuming the module holds it.
+    iic_write(0x02, 3);
+    delay(20);
+
+    byte td = 1;
+    bool td_ok = iic_read(0x02, &td, 1);
+    if (td_ok) {
+        switch (td) {
+            case 0: delay_t = 100; break;
+            case 1: delay_t = 20;  break;
+            case 2: delay_t = 10;  break;
+            case 3: delay_t = 5;   break;
+            default: delay_t = 20; break;
+        }
+    } else {
+        delay_t = 20;
+#if VERBOSE_STARTUP
+        Serial.println(F("# WARNING: first IMU read failed. Check SDA/SCL/power/address."));
+#endif
+    }
+    delay(delay_t);
+
+    attachInterrupt(digitalPinToInterrupt(2), Exti, RISING);
+
+    setupRangeSensors();
+
+    kalmanInit(&kf_acc_x,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_acc_y,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_acc_z,  0.02f, 0.05f, 10.0f);
+    kalmanInit(&kf_gyro_x, 0.05f, 0.5f,  10.0f);
+    kalmanInit(&kf_gyro_y, 0.05f, 0.5f,  10.0f);
+    kalmanInit(&kf_gyro_z, 0.05f, 0.5f,  10.0f);
+    kalmanInit(&kf_dist,   0.5f,  9.0f,  1000.0f);
+    kalmanInit(&kf_dist2,  0.5f,  9.0f,  1000.0f);
+    kalmanInit(&kf_dist3,  0.5f,  9.0f,  1000.0f);
+    kalmanInit(&kf_dist4,  0.5f,  9.0f,  1000.0f);
+
+    posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
+    posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
+    posvelInit(&kf_pos_z, 0.0f, 0.0f, 1.0f, 1.0f);
+
+    last_sample_ms = millis();
+    calibrate();
+
+    last_update_us = micros();
+    last_print_ms  = millis();
+    last_diag_ms   = millis();
+}
+
+void loop()
+{
+    serviceSerialCommands();
+    serviceDiagnostics();
+    serviceRangeSensors();       // non-blocking; takes whatever is ready
+
+    if (!sampleReady()) return;
+    if (!readIMU())     return;
+
+    unsigned long now_us = micros();
+    float dt = (now_us - last_update_us) / 1000000.0f;
+    last_update_us = now_us;
+    if (dt <= 0.0f || dt > 0.25f) dt = delay_t / 1000.0f;
+
+    // acc_gain removes the datasheet-vs-reality scale error. Without it a
+    // half-percent error becomes ~50 mm/s^2 of phantom vertical
+    // acceleration the moment you tilt away from the calibration pose.
+    float acc_x_g = my_95Q.acc_x * ACC_SCALE * acc_gain;
+    float acc_y_g = my_95Q.acc_y * ACC_SCALE * acc_gain;
+    float acc_z_g = my_95Q.acc_z * ACC_SCALE * acc_gain;
+
+    float gyro_x_dps = my_95Q.gyro_x * GYRO_SCALE;
+    float gyro_y_dps = my_95Q.gyro_y * GYRO_SCALE;
+    float gyro_z_dps = my_95Q.gyro_z * GYRO_SCALE;
+
+    float acc_x_mms2 = kalmanUpdate(&kf_acc_x, acc_x_g) * ACC_G_TO_MMS2;
+    float acc_y_mms2 = kalmanUpdate(&kf_acc_y, acc_y_g) * ACC_G_TO_MMS2;
+    float acc_z_mms2 = kalmanUpdate(&kf_acc_z, acc_z_g) * ACC_G_TO_MMS2;
+
+    float gyro_x_filt = kalmanUpdate(&kf_gyro_x, gyro_x_dps);
+    float gyro_y_filt = kalmanUpdate(&kf_gyro_y, gyro_y_dps);
+    float gyro_z_filt = kalmanUpdate(&kf_gyro_z, gyro_z_dps);
+
+    // --- Orientation EKF: fuse gyro + accel into a quaternion for
+    // roll/pitch -------------------------------------------------------
+    // Replaces the GY-95T's pre-fused roll/pitch with our own estimate, so
+    // gyro-bias drift is learned/removed and fast angular motion is
+    // tracked from the raw gyro at full rate instead of whatever the
+    // module's internal fusion does. Yaw is deliberately NOT taken from
+    // here unless USE_EKF_MAG_YAW is on - see that macro's comment.
+#if USE_ORIENTATION_EKF
+    float ekf_roll, ekf_pitch, ekf_yaw;
+    {
+        float gx = gyro_x_dps * 0.017453293f;   // deg/s -> rad/s
+        float gy = gyro_y_dps * 0.017453293f;
+        float gz = gyro_z_dps * 0.017453293f;
+        if (!ekf.inited) {
+            ekfInit(&ekf);
+            ekfSeedFromAccelMag(&ekf, acc_x_g, acc_y_g, acc_z_g,
+                                (float)my_95Q.mag_x, (float)my_95Q.mag_y,
+                                (float)my_95Q.mag_z);
+            // Zero yaw against the EKF's OWN seed, not yaw_ref_deg - that is
+            // captured from the GY-95T's separate internal fusion during
+            // calibrate() and lives in a different reference frame. Only
+            // matters if USE_EKF_MAG_YAW is later turned on.
+            ekfEuler(&ekf, &ekf_roll, &ekf_pitch, &ekf_yaw);
+            ekf_yaw_ref_deg = ekf_yaw;
+        }
+        ekfPredict(&ekf, gx, gy, gz, dt);
+        ekfCorrectVector(&ekf, acc_x_g, acc_y_g, acc_z_g,
+                         0.0f, 0.0f, GRAVITY_SIGN * 1.0f, ekf.Ra);
+#if USE_EKF_MAG_YAW
+        ekfCorrectVector(&ekf, (float)my_95Q.mag_x, (float)my_95Q.mag_y,
+                         (float)my_95Q.mag_z, 1.0f, 0.0f, 0.0f, ekf.Rm);
+#endif
+        ekfEuler(&ekf, &ekf_roll, &ekf_pitch, &ekf_yaw);
+    }
+    float ori_roll  = ekf_roll;
+    float ori_pitch = ekf_pitch;
+#if USE_EKF_MAG_YAW
+    float ori_yaw   = ekf_yaw - ekf_yaw_ref_deg;
+#else
+    // Mag-yaw correction is off, so the EKF's own yaw is pure gyro
+    // integration with no absolute reference - exactly the drift we're
+    // trying to remove. Keep using the GY-95T's own pre-fused yaw instead;
+    // only roll/pitch come from the EKF.
+    float ori_yaw   = referencedYaw();
+#endif
+#else
+    float ori_roll  = my_95Q.roll  / 100.0f;
+    float ori_pitch = my_95Q.pitch / 100.0f;
+    float ori_yaw   = referencedYaw();
+#endif
+    g_ori_roll = ori_roll; g_ori_pitch = ori_pitch; g_ori_yaw = ori_yaw;
+
+    // Navigation channel uses raw accel: the posvel filter has its own
+    // noise model, so smoothing first would double-count the filtering.
+    float wx_g, wy_g, wz_g;
+    rotateBodyToWorld(acc_x_g, acc_y_g, acc_z_g,
+                      ori_roll, ori_pitch, ori_yaw, &wx_g, &wy_g, &wz_g);
+
+    float res_x = wx_g * ACC_G_TO_MMS2;
+    float res_y = wy_g * ACC_G_TO_MMS2;
+    float res_z = (wz_g - GRAVITY_SIGN * 1.0f) * ACC_G_TO_MMS2;
+
+    float world_ax = res_x - acc_bias_world_x;
+    float world_ay = res_y - acc_bias_world_y;
+    float world_az = res_z - acc_bias_world_z;
+
+    float acc_mag_g  = sqrt(acc_x_g*acc_x_g + acc_y_g*acc_y_g + acc_z_g*acc_z_g);
+    float gyro_mag_d = sqrt(gyro_x_dps*gyro_x_dps + gyro_y_dps*gyro_y_dps + gyro_z_dps*gyro_z_dps);
+    statPush(acc_mag_g, gyro_mag_d);
+
+    bool stat_raw = statIsStationary();
+    if (!stat_raw) stationary_since_ms = 0;
+    else if (stationary_since_ms == 0) stationary_since_ms = millis();
+    bool is_stationary = stat_raw && (millis() - stationary_since_ms >= STAT_HOLD_MS);
+
+    posvelPredict(&kf_pos_x, world_ax, dt, Q_ACCEL_VAR);
+    posvelPredict(&kf_pos_y, world_ay, dt, Q_ACCEL_VAR);
+    posvelPredict(&kf_pos_z, world_az, dt, Q_ACCEL_VAR);
+
+#if USE_RANGE_CORRECTION
+    applyRangeCorrection(is_stationary, ori_roll, ori_pitch, ori_yaw);
+#endif
+
+    if (is_stationary) {
+        posvelZUPT(&kf_pos_x, 1.0f);
+        posvelZUPT(&kf_pos_y, 1.0f);
+        posvelZUPT(&kf_pos_z, 1.0f);
+
+        acc_bias_world_x += BIAS_TRACK_A * (res_x - acc_bias_world_x);
+        acc_bias_world_y += BIAS_TRACK_A * (res_y - acc_bias_world_y);
+        acc_bias_world_z += BIAS_TRACK_A * (res_z - acc_bias_world_z);
+    } else if (VEL_TAU_S > 0.0f) {
+        float leak = exp(-dt / VEL_TAU_S);
+        posvelLeak(&kf_pos_x, leak);
+        posvelLeak(&kf_pos_y, leak);
+        posvelLeak(&kf_pos_z, leak);
+    }
+
+    unsigned long now_ms = millis();
+    if (now_ms - last_print_ms < (unsigned long)(1000 / PRINT_HZ)) return;
+    last_print_ms = now_ms;
+
+    // --- Core: sent every line, this is what moves the model ---
+    Serial.print(F("ro:"));   Serial.print(g_ori_roll, 1);
+    Serial.print(F(",pi:"));  Serial.print(g_ori_pitch, 1);
+    Serial.print(F(",ya:"));  Serial.print(g_ori_yaw, 1);
+    Serial.print(F(",px:"));  Serial.print(kf_pos_x.pos, 1);
+    Serial.print(F(",py:"));  Serial.print(kf_pos_y.pos, 1);
+    Serial.print(F(",pz:"));  Serial.print(kf_pos_z.pos, 1);
+    Serial.print(F(",st:"));  Serial.print(is_stationary ? 1 : 0);
+
+    // --- Extras: one group per line, cycling. Each refreshes at
+    //     PRINT_HZ / 5, which is plenty for a numeric readout. ---
+    switch (extras_group) {
+    case 0:
+        Serial.print(F(",ax:")); Serial.print(acc_x_mms2, 0);
+        Serial.print(F(",ay:")); Serial.print(acc_y_mms2, 0);
+        Serial.print(F(",az:")); Serial.print(acc_z_mms2, 0);
+        break;
+    case 1:
+        Serial.print(F(",gx:")); Serial.print(gyro_x_filt, 2);
+        Serial.print(F(",gy:")); Serial.print(gyro_y_filt, 2);
+        Serial.print(F(",gz:")); Serial.print(gyro_z_filt, 2);
+        break;
+    case 2:
+        Serial.print(F(",mx:")); Serial.print(my_95Q.mag_x);
+        Serial.print(F(",my:")); Serial.print(my_95Q.mag_y);
+        Serial.print(F(",mz:")); Serial.print(my_95Q.mag_z);
+        break;
+    case 3:
+        // Channel 1 (X / sideways): distance, state, innovation.
+        Serial.print(F(",d1:"));  Serial.print(dist1_mm, 0);
+        Serial.print(F(",r1s:")); Serial.print(ch1.state);
+        Serial.print(F(",r1i:")); Serial.print(ch1.innov, 1);
+        break;
+    case 4:
+        // Channel 2 (Y / forward, at phantom): distance, state, innovation.
+        Serial.print(F(",d2:"));  Serial.print(dist2_mm, 0);
+        Serial.print(F(",r2s:")); Serial.print(ch2.state);
+        Serial.print(F(",r2i:")); Serial.print(ch2.innov, 1);
+        break;
+    case 5:
+        // Channel 3 (Z / up): distance, state, innovation, plus temp.
+        Serial.print(F(",d3:"));  Serial.print(dist3_mm, 0);
+        Serial.print(F(",r3s:")); Serial.print(ch3.state);
+        Serial.print(F(",r3i:")); Serial.print(ch3.innov, 1);
+        Serial.print(F(",tp:"));  Serial.print(my_95Q.temp / 100.0, 1);
+        break;
+    default:
+        // Channel 4 (-X, differential partner of ch2): distance, state, innov.
+        Serial.print(F(",d4:"));  Serial.print(dist4_mm, 0);
+        Serial.print(F(",r4s:")); Serial.print(ch4.state);
+        Serial.print(F(",r4i:")); Serial.print(ch4.innov, 1);
+        break;
+    }
+    if (++extras_group > 6) extras_group = 0;
+
+    Serial.println();
+}
+
+/* ---------------- low level ----------------------------------------- */
+
+void Exti()
+{
+    ready_Ok = 1;
+    int_count++;
+}
+
+bool iic_read(unsigned char add, unsigned char *data, unsigned char len)
+{
+    Wire.beginTransmission(iic_add);
+    Wire.write(add);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    byte received = Wire.requestFrom(iic_add, (int)len);
+    if (received != len) return false;
+
+    for (byte j = 0; j < len; j++) *data++ = Wire.read();
+    return true;
+}
+
+void iic_write(char add, unsigned char data)
+{
+    Wire.beginTransmission(iic_add);
+    Wire.write((uint8_t)add);
+    Wire.write((uint8_t)data);
+    Wire.endTransmission();
+}
