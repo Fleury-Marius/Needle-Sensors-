@@ -115,6 +115,7 @@ KEY_MAP = {
     "px": "pos_x_mm", "py": "pos_y_mm", "pz": "pos_z_mm",
     "vx": "vel_x_mms", "vy": "vel_y_mms", "vz": "vel_z_mms",
     "ax": "acc_x",  "ay": "acc_y",  "az": "acc_z",
+    "wax": "wacc_x", "way": "wacc_y", "waz": "wacc_z",
     "gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z",
     "mx": "mag_x",  "my": "mag_y",  "mz": "mag_z",
     "d1": "distance_mm", "d2": "distance_mm2",
