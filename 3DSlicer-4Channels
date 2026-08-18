@@ -83,23 +83,20 @@ PROBE4_NODE_NAME = "VL6180XProbe4"
 # so these sit just behind the tip looking out past the needle. Adjust to
 # match how they are actually glued on.
 # Keep these DIR values in sync with BEAM1/BEAM2_BODY_* in the sketch.
-# Sensor 1 points body +X (right), sensor 2 points body +Y (forward) -
-# corrected empirically: pushing toward the phantom moved channel 2's
-# innov, not channel 1's, so the mounting is the opposite of what an
-# earlier version of this comment assumed.
+# Sensor 1 points body +X (right), sensor 2 points body +Y (forward).
 # DIR is in the model's LOCAL frame. MOUNT_ROTATION re-aims the model at
 # rest, so local axes do NOT equal world axes on screen:
 #   local +X -> world +X (sideways)     local +Z -> world +Y (forward)
 #   local +Y -> world -Z (up/down)  <-- do NOT use for forward/sideways
 # So "forward" must be local +Z, and "sideways" stays on local X.
 SENSOR1_LOCAL_POS = (0.0, 0.0, 120.0)
-SENSOR1_LOCAL_DIR = (1.0, 0.0, 0.0)     # ch1 -> world +X, sideways (local +X)
+SENSOR1_LOCAL_DIR = (0.0, 0.0, 1.0)     # ch1 -> world +Y, forward (local +Z)
 SENSOR2_LOCAL_POS = (0.0, 0.0, 130.0)
-SENSOR2_LOCAL_DIR = (0.0, 0.0, 1.0)     # ch2 -> world +Y, forward (local +Z)
+SENSOR2_LOCAL_DIR = (-1.0, 0.0, 0.0)    # probe shows d1 = -X now (local -X) [flipped]
 SENSOR3_LOCAL_POS = (0.0, 0.0, 125.0)
 SENSOR3_LOCAL_DIR = (0.0, -1.0, 0.0)    # ch3 -> world +Z, up (local -Y -> world +Z)
 SENSOR4_LOCAL_POS = (0.0, 0.0, 128.0)
-SENSOR4_LOCAL_DIR = (-1.0, 0.0, 0.0)    # ch4 -> world -X, opposite ch1 (local -X)
+SENSOR4_LOCAL_DIR = (1.0, 0.0, 0.0)     # probe shows d4 = +X now (local +X) [flipped]
 
 PROBE_MAX_MM    = 250.0
 PROBE_RADIUS_MM = 1.0
@@ -360,16 +357,19 @@ class RangeProbe:
         self.node = node
         self.lastValid = None
 
-    def update(self, distance_mm):
-        """distance_mm < 0 means the sensor reported nothing usable."""
+    def update(self, distance_mm, locked=True):
+        """distance_mm < 0 means the sensor reported nothing usable.
+        locked=False means the firmware is IGNORING this sensor (R=inf,
+        not state 2), so we render it as blind even if it has a reading."""
         display = self.node.GetDisplayNode()
 
-        if distance_mm is None or distance_mm < 0:
-            # Out of range or bad read: draw it dim and full length so it
-            # is obvious the beam is seeing nothing rather than seeing zero.
+        if distance_mm is None or distance_mm < 0 or not locked:
+            # No target, OR a reading the filter is ignoring (R=inf): draw it
+            # dim and full length so it is obvious this beam is NOT correcting
+            # position - the IMU is dead-reckoning this axis.
             self._setLength(PROBE_MAX_MM)
             display.SetColor(0.45, 0.45, 0.45)
-            display.SetOpacity(0.35)
+            display.SetOpacity(0.30)
             return
 
         d = max(0.0, min(float(distance_mm), PROBE_MAX_MM))
@@ -544,10 +544,14 @@ class GY95TController:
         # Probes are parented to the same transform, so they inherit the
         # syringe's pose for free; only their length and colour change.
         if self.probe1 is not None and SHOW_PROBES:
-            self.probe1.update(data.get("distance_mm", -1.0))
-            self.probe2.update(data.get("distance_mm2", -1.0))
-            self.probe3.update(data.get("distance_mm3", -1.0))
-            self.probe4.update(data.get("distance_mm4", -1.0))
+            self.probe1.update(data.get("distance_mm2", -1.0),
+                               int(data.get("r2_state", 0)) == 2)
+            self.probe2.update(data.get("distance_mm", -1.0),
+                               int(data.get("r1_state", 0)) == 2)
+            self.probe3.update(data.get("distance_mm3", -1.0),
+                               int(data.get("r3_state", 0)) == 2)
+            self.probe4.update(data.get("distance_mm4", -1.0),
+                               int(data.get("r4_state", 0)) == 2)
 
         if not SAFE_MODE:
             self._updateBox(data, position)
@@ -607,14 +611,25 @@ class GY95TController:
                 f"Y: {data.get('vel_y_mms', 0):.1f}  "
                 f"Z: {data.get('vel_z_mms', 0):.1f}",
 
-                f"Range +X: {self._fmtRange(data.get('distance_mm', -1.0))}"
-                f"{self._fmtChannel(data, 1)}",
-
+                # SENSOR-TO-AXIS MAP (must match the firmware BEAM* defines):
+                #   forward sensor is wired to SHUT D5 = firmware channel 2 = d2
+                #   sideways +X sensor -> channel 1 = d1
+                #   -X sensor          -> channel 4 = d4
+                #   up +Z sensor       -> channel 3 = d3
+                # So +Y(fwd) reads d2/state2, +X reads d1/state1. This is
+                # correct and intentional - do NOT "simplify" +Y back to d1
+                # unless the forward sensor is physically moved to D4.
                 f"Range +Y (fwd): {self._fmtRange(data.get('distance_mm2', -1.0))}"
                 f"{self._fmtChannel(data, 2)}",
 
-                f"Range -X: {self._fmtRange(data.get('distance_mm4', -1.0))}"
+                # X pair flipped to match wiring: channel 4 (d4) = +X,
+                #   channel 1 (d1) = -X. Keep these in sync with the firmware
+                #   BEAM1/BEAM4 X signs.
+                f"Range +X: {self._fmtRange(data.get('distance_mm4', -1.0))}"
                 f"{self._fmtChannel(data, 4)}",
+
+                f"Range -X: {self._fmtRange(data.get('distance_mm', -1.0))}"
+                f"{self._fmtChannel(data, 1)}",
 
                 f"Range +Z (up): {self._fmtRange(data.get('distance_mm3', -1.0))}"
                 f"{self._fmtChannel(data, 3)}",
@@ -643,8 +658,12 @@ class GY95TController:
         state = int(data.get(f"r{n}_state", 0))
         label = cls.RANGE_STATES.get(state, "?")
         if state == 2:
+            # Locked: sensor is trusted, correcting position (finite R).
             return f"   {label}, innov {data.get(f'r{n}_innov', 0):+.1f} mm"
-        return f"   [{label}]"
+        # Not locked: firmware has set R effectively infinite, so this sensor
+        # is IGNORED and the IMU dead-reckons this axis. Flag it loudly so the
+        # blind axis is obvious at a glance.
+        return f"   [{label}]  >>> R=inf, IGNORED (IMU only) <<<"
 
     # --------------------------------------------------------- controls
     def setProbes(self, visible):
