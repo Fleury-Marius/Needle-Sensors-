@@ -1,0 +1,1112 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MERGED Slicer script: GY-95T needle tracking + phantom pegboard, in one paste.
+
+Paste this whole thing into Slicer's Python Interactor after:
+  - connecting ArduinoConnect (9600 baud), and
+  - loading Syringe_fc.stl and phantom_board.stl (File > Add Data),
+    or set STL_FILE_PATH / PHANTOM_STL_PATH below to auto-load them.
+
+It builds, in order:
+  1. the live needle tracker (creates `controller`)
+  2. the phantom board + A1..G7 target markers, placed to face the needle
+  3. the two-touch alignment + error-readout helpers
+
+Runtime commands (type in the Interactor):
+  controller.zeroAll()              # zero orientation + position at rest
+  controller.zeroOrientation()      # make current pose the rest pose
+  controller.zeroPosition()         # re-origin position only
+  align_phantom('D4','G4') -> move to G4 -> confirm_align()
+  controller_target('B6')           # live tip-to-hole error
+  frame_phantom_view()              # recenter the camera
+"""
+
+import time
+import numpy as np
+import vtk
+import qt
+import slicer
+
+# ---------------------------------------------------------------- nodes
+ARDUINO_NODE_NAME   = "arduinoNode"     # rename if yours differs
+TRANSFORM_NODE_NAME = "GY95TTransform"
+STL_NODE_NAME       = "Syringe_fc"
+STL_FILE_PATH       = None              # fallback path, if not already loaded
+FLOOR_NODE_NAME     = "FloorGrid"
+AXES_NODE_NAME      = "WorldAxes"
+TRAIL_NODE_NAME     = "NeedleTrail"
+
+# ----------------------------------------------------------- safe mode
+# True  -> no trail, no floor grid, no axes, no annotation. Just the
+#          syringe moving. Use this to prove the pipeline is stable, then
+#          switch back to False.
+SAFE_MODE = False
+
+UPDATE_INTERVAL_MS = 50      # timer period: 20 UI updates/s
+MAX_ERRORS         = 10      # consecutive failures before self-detaching
+
+# ------------------------------------------------------------- geometry
+MOUNT_ROTATION = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0],
+])
+
+STL_Z_MIN = 0.0
+STL_Z_MAX = 147.6
+PIVOT_TIP    = (0.0, 0.0, STL_Z_MAX)
+PIVOT_CENTER = (0.0, 0.0, (STL_Z_MIN + STL_Z_MAX) / 2.0)
+PIVOT_LOCAL_POS = PIVOT_CENTER
+TIP_LOCAL_POS   = PIVOT_TIP
+
+# ------------------------------------------------------------ viewport
+POS_X_RANGE = (-250.0, 250.0)
+POS_Y_RANGE = (-200.0, 200.0)
+POS_Z_RANGE = (-100.0, 1000.0)
+
+# --------------------------------------------------------------- trail
+SHOW_TRAIL        = True
+TRAIL_MAX_POINTS  = 1500
+TRAIL_MIN_STEP_MM = 0.5
+TRAIL_COLOR       = (1.0, 0.45, 0.1)
+
+# ---------------------------------------------------------- range probes
+SHOW_PROBES     = True
+PROBE1_NODE_NAME = "VL6180XProbe1"
+PROBE2_NODE_NAME = "VL6180XProbe2"
+PROBE3_NODE_NAME = "VL6180XProbe3"
+PROBE4_NODE_NAME = "VL6180XProbe4"
+
+# Where each sensor sits and which way it looks, in the model's LOCAL
+# frame (mm). The STL runs from Z=0 at the plunger to Z~147.6 at the tip,
+# so these sit just behind the tip looking out past the needle. Adjust to
+# match how they are actually glued on.
+# Keep these DIR values in sync with BEAM1/BEAM2_BODY_* in the sketch.
+# Sensor 1 points body +X (right), sensor 2 points body +Y (forward).
+# DIR is in the model's LOCAL frame. MOUNT_ROTATION re-aims the model at
+# rest, so local axes do NOT equal world axes on screen:
+#   local +X -> world +X (sideways)     local +Z -> world +Y (forward)
+#   local +Y -> world -Z (up/down)  <-- do NOT use for forward/sideways
+# So "forward" must be local +Z, and "sideways" stays on local X.
+SENSOR1_LOCAL_POS = (0.0, 0.0, 120.0)
+SENSOR1_LOCAL_DIR = (0.0, 0.0, 1.0)     # ch1 -> world +Y, forward (local +Z)
+SENSOR2_LOCAL_POS = (0.0, 0.0, 130.0)
+SENSOR2_LOCAL_DIR = (-1.0, 0.0, 0.0)    # probe shows d1 = -X now (local -X) [flipped]
+SENSOR3_LOCAL_POS = (0.0, 0.0, 125.0)
+SENSOR3_LOCAL_DIR = (0.0, -1.0, 0.0)    # ch3 -> world +Z, up (local -Y -> world +Z)
+SENSOR4_LOCAL_POS = (0.0, 0.0, 128.0)
+SENSOR4_LOCAL_DIR = (1.0, 0.0, 0.0)     # probe shows d4 = +X now (local +X) [flipped]
+
+PROBE_MAX_MM    = 250.0
+PROBE_RADIUS_MM = 1.0
+PROBE_NEAR_MM   = 50.0     # red below this
+PROBE_MID_MM    = 150.0    # yellow below this, green above
+
+# ----------------------------------------------------------------- box
+BOX_FONT_MAX = 18
+BOX_COMPACT  = False    # True = the five-line layout only
+
+
+# The sketch sends compact keys to fit inside 9600 baud. Long names are
+# still accepted, so an older sketch keeps working unchanged.
+KEY_MAP = {
+    "ro": "roll",   "pi": "pitch",  "ya": "yaw",
+    "px": "pos_x_mm", "py": "pos_y_mm", "pz": "pos_z_mm",
+    "vx": "vel_x_mms", "vy": "vel_y_mms", "vz": "vel_z_mms",
+    "ax": "acc_x",  "ay": "acc_y",  "az": "acc_z",
+    "wax": "wacc_x", "way": "wacc_y", "waz": "wacc_z",
+    "gx": "gyro_x", "gy": "gyro_y", "gz": "gyro_z",
+    "mx": "mag_x",  "my": "mag_y",  "mz": "mag_z",
+    "d1": "distance_mm", "d2": "distance_mm2",
+    "r1s": "r1_state", "r1i": "r1_innov",
+    "r2s": "r2_state", "r2i": "r2_innov",
+    "d3": "distance_mm3", "r3s": "r3_state", "r3i": "r3_innov",
+    "d4": "distance_mm4", "r4s": "r4_state", "r4i": "r4_innov",
+    "tp": "temp",   "lv": "leve",   "st": "stationary",
+}
+
+
+def parse_line(raw):
+    """Parse every complete line in the buffer into one dict of floats.
+
+    At 9600 baud the sketch cannot afford to send every field on every
+    line, so it rotates the secondary values across five lines. This
+    returns whatever arrived; the controller merges it into a persistent
+    state dict so nothing reads as zero just because it was not in the
+    most recent line."""
+    out = {}
+    text = str(raw).replace("\r", "\n")
+    lines = text.split("\n")
+
+    for idx, line in enumerate(lines):
+        # The last line may be a partial write still in flight. Keep it
+        # only if the buffer ended cleanly.
+        if idx == len(lines) - 1 and not text.endswith("\n") and len(lines) > 1:
+            continue
+        for token in line.split(","):
+            if ":" not in token:
+                continue
+            key, val = token.split(":", 1)
+            key = key.strip()
+            try:
+                out[KEY_MAP.get(key, key)] = float(val.strip())
+            except ValueError:
+                pass
+    return out
+
+
+def euler_to_rotation_matrix(roll_deg, pitch_deg, yaw_deg):
+    r, p, y = np.radians([roll_deg, pitch_deg, yaw_deg])
+    Rx = np.array([[1, 0, 0],
+                   [0, np.cos(r), -np.sin(r)],
+                   [0, np.sin(r),  np.cos(r)]])
+    Ry = np.array([[ np.cos(p), 0, np.sin(p)],
+                   [0, 1, 0],
+                   [-np.sin(p), 0, np.cos(p)]])
+    Rz = np.array([[np.cos(y), -np.sin(y), 0],
+                   [np.sin(y),  np.cos(y), 0],
+                   [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def read_arduino_payload(node):
+    """ArduinoConnect exposes its data differently across versions."""
+    if hasattr(node, "GetParameter"):
+        try:
+            val = node.GetParameter("Data")
+            if val:
+                return val
+        except Exception:
+            pass
+    if hasattr(node, "GetText"):
+        try:
+            return node.GetText()
+        except Exception:
+            pass
+    if hasattr(node, "GetAttribute"):
+        try:
+            return node.GetAttribute("Data")
+        except Exception:
+            pass
+    return None
+
+
+def get_or_create_transform(name):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None:
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLinearTransformNode", name)
+        print(f"Created transform node '{name}'.")
+    return node
+
+
+def get_or_load_syringe(name, file_path, transform_node):
+    node = slicer.mrmlScene.GetFirstNodeByName(name)
+    if node is None and file_path:
+        print(f"Node '{name}' not found; loading from '{file_path}'...")
+        node = slicer.util.loadModel(file_path)
+        if node is not None:
+            node.SetName(name)
+    if node is None:
+        raise RuntimeError(
+            f"No model node named '{name}' in the scene and no STL_FILE_PATH "
+            "given. Load Syringe_fc.stl (File > Add Data) or set STL_FILE_PATH."
+        )
+    node.SetAndObserveTransformNodeID(transform_node.GetID())
+    return node
+
+
+def create_floor_grid(name=FLOOR_NODE_NAME):
+    existing = slicer.mrmlScene.GetFirstNodeByName(name)
+    if existing is not None:
+        return existing
+
+    src = vtk.vtkPlaneSource()
+    src.SetOrigin(POS_X_RANGE[0], POS_Y_RANGE[0], 0)
+    src.SetPoint1(POS_X_RANGE[1], POS_Y_RANGE[0], 0)
+    src.SetPoint2(POS_X_RANGE[0], POS_Y_RANGE[1], 0)
+    src.SetXResolution(20)
+    src.SetYResolution(20)
+    src.Update()
+
+    node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+    node.SetAndObservePolyData(src.GetOutput())
+    node.CreateDefaultDisplayNodes()
+    d = node.GetDisplayNode()
+    d.SetRepresentation(1)
+    d.SetColor(0.2, 0.8, 0.2)
+    d.SetLineWidth(1)
+    d.SetOpacity(0.5)
+    d.SetLighting(False)
+    return node
+
+
+def create_world_axes(name=AXES_NODE_NAME, length=80.0):
+    existing = slicer.mrmlScene.GetFirstNodeByName(name)
+    if existing is not None:
+        return existing
+
+    pts = vtk.vtkPoints()
+    lines = vtk.vtkCellArray()
+    pts.InsertNextPoint(0, 0, 0)
+    for axis in range(3):
+        end = [0.0, 0.0, 0.0]
+        end[axis] = length
+        pid = pts.InsertNextPoint(end)
+        line = vtk.vtkLine()
+        line.GetPointIds().SetId(0, 0)
+        line.GetPointIds().SetId(1, pid)
+        lines.InsertNextCell(line)
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(pts)
+    poly.SetLines(lines)
+
+    node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+    node.SetAndObservePolyData(poly)
+    node.CreateDefaultDisplayNodes()
+    d = node.GetDisplayNode()
+    d.SetColor(0.9, 0.9, 0.9)
+    d.SetLineWidth(3)
+    d.SetLighting(False)
+    return node
+
+
+class NeedleTrail:
+    """Growing polyline of tip positions. Only ever touched from the timer,
+    never from the MRML observer, so it is never modified mid-render."""
+
+    def __init__(self, name=TRAIL_NODE_NAME):
+        self.points = vtk.vtkPoints()
+        self.lines = vtk.vtkCellArray()
+        self.poly = vtk.vtkPolyData()
+        self.poly.SetPoints(self.points)
+        self.poly.SetLines(self.lines)
+
+        node = slicer.mrmlScene.GetFirstNodeByName(name)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObservePolyData(self.poly)
+        node.CreateDefaultDisplayNodes()
+        d = node.GetDisplayNode()
+        d.SetColor(*TRAIL_COLOR)
+        d.SetLineWidth(3)
+        d.SetLighting(False)
+        self.node = node
+        self.last = None
+
+    def add(self, p):
+        if self.last is not None and np.linalg.norm(p - self.last) < TRAIL_MIN_STEP_MM:
+            return
+        if self.points.GetNumberOfPoints() >= TRAIL_MAX_POINTS:
+            self.clear()
+        pid = self.points.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+        if pid > 0:
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, pid - 1)
+            line.GetPointIds().SetId(1, pid)
+            self.lines.InsertNextCell(line)
+            self.lines.Modified()
+        self.points.Modified()
+        self.poly.Modified()
+        self.last = p.copy()
+
+    def clear(self):
+        self.points.Reset()
+        self.lines.Reset()
+        self.points.Modified()
+        self.lines.Modified()
+        self.poly.Modified()
+        self.last = None
+
+    def setVisible(self, visible):
+        self.node.GetDisplayNode().SetVisibility(bool(visible))
+
+
+class RangeProbe:
+    """A tube from the sensor position out along its beam, its length set
+    by the live range reading and its colour by proximity.
+
+    The VTK pipeline lives on this object rather than as attributes stuck
+    onto the MRML node - node attributes vanish between script runs and
+    the old code had to rebuild them defensively."""
+
+    def __init__(self, name, local_pos, local_dir, transform_node):
+        self.origin = np.array(local_pos, dtype=float)
+        d = np.array(local_dir, dtype=float)
+        n = np.linalg.norm(d)
+        self.dir = d / n if n > 0 else np.array([0.0, 0.0, 1.0])
+
+        self.line = vtk.vtkLineSource()
+        self.line.SetPoint1(*self.origin)
+        self.line.SetPoint2(*(self.origin + self.dir * PROBE_RADIUS_MM))
+
+        self.tube = vtk.vtkTubeFilter()
+        self.tube.SetInputConnection(self.line.GetOutputPort())
+        self.tube.SetRadius(PROBE_RADIUS_MM)
+        self.tube.SetNumberOfSides(12)
+        self.tube.CappingOn()
+        self.tube.Update()
+
+        node = slicer.mrmlScene.GetFirstNodeByName(name)
+        if node is None:
+            node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", name)
+        node.SetAndObservePolyData(self.tube.GetOutput())
+        node.CreateDefaultDisplayNodes()
+        node.GetDisplayNode().SetColor(0.2, 1.0, 0.2)
+        node.SetAndObserveTransformNodeID(transform_node.GetID())
+        self.node = node
+        self.lastValid = None
+
+    def update(self, distance_mm, locked=True):
+        """distance_mm < 0 means the sensor reported nothing usable.
+        locked=False means the firmware is IGNORING this sensor (R=inf,
+        not state 2), so we render it as blind even if it has a reading."""
+        display = self.node.GetDisplayNode()
+
+        if distance_mm is None or distance_mm < 0 or not locked:
+            # No target, OR a reading the filter is ignoring (R=inf): draw it
+            # dim and full length so it is obvious this beam is NOT correcting
+            # position - the IMU is dead-reckoning this axis.
+            self._setLength(PROBE_MAX_MM)
+            display.SetColor(0.45, 0.45, 0.45)
+            display.SetOpacity(0.30)
+            return
+
+        d = max(0.0, min(float(distance_mm), PROBE_MAX_MM))
+        self._setLength(max(d, 0.01))
+        display.SetOpacity(1.0)
+
+        if d < PROBE_NEAR_MM:
+            display.SetColor(1.0, 0.2, 0.2)
+        elif d < PROBE_MID_MM:
+            display.SetColor(1.0, 0.85, 0.2)
+        else:
+            display.SetColor(0.2, 1.0, 0.2)
+        self.lastValid = d
+
+    def _setLength(self, length):
+        self.line.SetPoint2(*(self.origin + self.dir * length))
+        self.line.Update()
+        self.tube.Update()
+        self.node.SetAndObservePolyData(self.tube.GetOutput())
+
+    def setVisible(self, visible):
+        self.node.GetDisplayNode().SetVisibility(bool(visible))
+
+
+class GY95TController:
+
+    def __init__(self, arduino_node_name=ARDUINO_NODE_NAME):
+        self.arduinoNode = slicer.mrmlScene.GetFirstNodeByName(arduino_node_name)
+        if self.arduinoNode is None:
+            raise RuntimeError(
+                f"Could not find node '{arduino_node_name}'. Connect "
+                "ArduinoConnect first."
+            )
+
+        self.transformNode = get_or_create_transform(TRANSFORM_NODE_NAME)
+        self.syringeNode = get_or_load_syringe(STL_NODE_NAME, STL_FILE_PATH, self.transformNode)
+
+        self.floorNode = None
+        self.axesNode = None
+        self.trail = None
+        self.probe1 = None
+        self.probe2 = None
+        self.probe3 = None
+        self.probe4 = None
+        if not SAFE_MODE:
+            self.floorNode = create_floor_grid()
+            self.axesNode = create_world_axes()
+            self.trail = NeedleTrail()
+            self.trail.setVisible(SHOW_TRAIL)
+            self.probe1 = RangeProbe(PROBE1_NODE_NAME, SENSOR1_LOCAL_POS,
+                                     SENSOR1_LOCAL_DIR, self.transformNode)
+            self.probe2 = RangeProbe(PROBE2_NODE_NAME, SENSOR2_LOCAL_POS,
+                                     SENSOR2_LOCAL_DIR, self.transformNode)
+            self.probe3 = RangeProbe(PROBE3_NODE_NAME, SENSOR3_LOCAL_POS,
+                                     SENSOR3_LOCAL_DIR, self.transformNode)
+            self.probe4 = RangeProbe(PROBE4_NODE_NAME, SENSOR4_LOCAL_POS,
+                                     SENSOR4_LOCAL_DIR, self.transformNode)
+            self.probe1.setVisible(SHOW_PROBES)
+            self.probe2.setVisible(SHOW_PROBES)
+            self.probe3.setVisible(SHOW_PROBES)
+            self.probe4.setVisible(SHOW_PROBES)
+
+        self.matrix = vtk.vtkMatrix4x4()
+        self.pivot = np.array(PIVOT_LOCAL_POS, dtype=float)
+        self.tipLocal = np.array(TIP_LOCAL_POS, dtype=float)
+
+        self.rawPosition = np.zeros(3)
+        self.originOffset = np.zeros(3)
+        # Pivot lock ("needle in patient" mode): when engaged, the tracked
+        # entry POSITION is frozen at lockedPosition, so the needle pivots
+        # about that fixed entry point while orientation still updates - the
+        # tip swings around the entry as you change the needle's angle.
+        self.positionLocked = False
+        self.lockedPosition = np.zeros(3)
+        self.orientOffset = np.eye(3)   # identity until zeroOrientation()
+        self._lastRlive = np.eye(3)
+        self.clamped = False
+        self._warnedNoPosition = False
+
+        self.state = {}             # merged field values across lines
+        self._pending = None        # written by observer, read by timer
+        self._busy = False          # reentrancy guard
+        self._errors = 0
+        self._samples = 0
+
+        self._applyTransform(np.eye(3), np.zeros(3))
+
+        layoutManager = slicer.app.layoutManager()
+        threeDWidget = layoutManager.threeDWidget(0)
+        self.threeDView = threeDWidget.threeDView()
+        threeDWidget.threeDController().resetFocalPoint()
+
+        if not SAFE_MODE:
+            ca = self.threeDView.cornerAnnotation()
+            ca.GetTextProperty().SetColor(1, 1, 1)
+            try:
+                ca.SetMaximumFontSize(BOX_FONT_MAX)
+            except AttributeError:
+                pass
+
+        # Observer: as close to a no-op as possible.
+        self.observerTag = self.arduinoNode.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self.onArduinoDataUpdated
+        )
+
+        # Timer: everything expensive happens here, on the main loop.
+        self.timer = qt.QTimer()
+        self.timer.setInterval(UPDATE_INTERVAL_MS)
+        self.timer.connect("timeout()", self._tick)
+        self.timer.start()
+
+        print(f"GY95TController running (SAFE_MODE={SAFE_MODE}). "
+              "Call controller.stop() before re-running this script.")
+
+    # ---------------------------------------------------------- observer
+    def onArduinoDataUpdated(self, caller, event):
+        """Copy and return. No VTK calls, no rendering, no exceptions."""
+        try:
+            self._pending = read_arduino_payload(self.arduinoNode)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- timer
+    def _tick(self):
+        if self._busy:
+            return
+        payload, self._pending = self._pending, None
+        if payload is None:
+            return
+
+        self._busy = True
+        try:
+            self._update(payload)
+            self._errors = 0
+        except Exception as exc:
+            self._errors += 1
+            print(f"GY95T update error ({self._errors}/{MAX_ERRORS}): {exc}")
+            if self._errors >= MAX_ERRORS:
+                print("Too many consecutive errors - detaching to protect Slicer.")
+                self.stop()
+        finally:
+            self._busy = False
+
+    def _update(self, payload):
+        incoming = parse_line(payload)
+        if not incoming:
+            return
+
+        # Merge rather than replace: each line carries the pose plus only
+        # one group of secondary values.
+        self.state.update(incoming)
+        data = self.state
+        if not all(k in data for k in ("roll", "pitch", "yaw")):
+            return
+        self._samples += 1
+
+        R_live = euler_to_rotation_matrix(data["roll"], data["pitch"], data["yaw"])
+        self._lastRlive = R_live
+        # Orientation zero: multiply by the inverse of the pose captured
+        # when zeroOrientation() was called, so "rest" is whatever pose the
+        # device was in then - independent of IMU heading drift.
+        R_live = R_live @ self.orientOffset
+
+        if all(k in data for k in ("pos_x_mm", "pos_y_mm", "pos_z_mm")):
+            self.rawPosition = np.array([data["pos_x_mm"], data["pos_y_mm"], data["pos_z_mm"]])
+        elif not self._warnedNoPosition:
+            print("NOTE: no pos_x_mm/pos_y_mm/pos_z_mm in the stream - the model "
+                  "will rotate but stay parked.")
+            self._warnedNoPosition = True
+
+        # Normal: position follows the tracker. Pivot-locked: hold the entry
+        # point fixed so the needle rotates about it (orientation still live
+        # below, so the tip swings around the frozen entry).
+        if self.positionLocked:
+            position = self.lockedPosition
+        else:
+            position = self._clamp(self.rawPosition - self.originOffset)
+        R = self._applyTransform(R_live, position)
+
+        if self.trail is not None and SHOW_TRAIL:
+            tipWorld = R @ (self.tipLocal - self.pivot) + self.pivot + position
+            self.trail.add(tipWorld)
+
+        # Probes are parented to the same transform, so they inherit the
+        # syringe's pose for free; only their length and colour change.
+        if self.probe1 is not None and SHOW_PROBES:
+            self.probe1.update(data.get("distance_mm2", -1.0),
+                               int(data.get("r2_state", 0)) == 2)
+            self.probe2.update(data.get("distance_mm", -1.0),
+                               int(data.get("r1_state", 0)) == 2)
+            self.probe3.update(data.get("distance_mm3", -1.0),
+                               int(data.get("r3_state", 0)) == 2)
+            self.probe4.update(data.get("distance_mm4", -1.0),
+                               int(data.get("r4_state", 0)) == 2)
+
+        if not SAFE_MODE:
+            self._updateBox(data, position)
+
+        self.threeDView.scheduleRender()
+
+    # ------------------------------------------------------------- pose
+    def _applyTransform(self, R_live, position):
+        R = R_live @ MOUNT_ROTATION
+        translation = (self.pivot - R @ self.pivot) + position
+        for i in range(3):
+            for j in range(3):
+                self.matrix.SetElement(i, j, R[i, j])
+            self.matrix.SetElement(i, 3, translation[i])
+        self.transformNode.SetMatrixTransformToParent(self.matrix)
+        return R
+
+    def _clamp(self, p):
+        c = np.array([
+            min(max(p[0], POS_X_RANGE[0]), POS_X_RANGE[1]),
+            min(max(p[1], POS_Y_RANGE[0]), POS_Y_RANGE[1]),
+            min(max(p[2], POS_Z_RANGE[0]), POS_Z_RANGE[1]),
+        ])
+        self.clamped = bool(np.any(np.abs(c - p) > 1e-6))
+        return c
+
+    # -------------------------------------------------------------- box
+    def _updateBox(self, data, position):
+        flag = "  [CLAMPED]" if self.clamped else ""
+        if self.positionLocked:
+            flag += "  [PIVOT LOCKED - needle in patient]"
+        lines = [
+            f"Roll: {data.get('roll', 0):.2f}  "
+            f"Pitch: {data.get('pitch', 0):.2f}  "
+            f"Yaw: {data.get('yaw', 0):.2f}",
+
+            f"Accel (mm/s^2)  X: {data.get('acc_x', 0):.0f}  "
+            f"Y: {data.get('acc_y', 0):.0f}  "
+            f"Z: {data.get('acc_z', 0):.0f}",
+
+            f"Gyro (deg/s)  X: {data.get('gyro_x', 0):.2f}  "
+            f"Y: {data.get('gyro_y', 0):.2f}  "
+            f"Z: {data.get('gyro_z', 0):.2f}",
+
+            f"Mag  X: {data.get('mag_x', 0):.0f}  "
+            f"Y: {data.get('mag_y', 0):.0f}  "
+            f"Z: {data.get('mag_z', 0):.0f}",
+
+            f"Position (mm)  X: {position[0]:.1f}  "
+            f"Y: {position[1]:.1f}  "
+            f"Z: {position[2]:.1f}{flag}",
+        ]
+        if not BOX_COMPACT:
+            lines += [
+                f"Temp: {data.get('temp', 0):.2f} C   "
+                f"Level: {data.get('leve', 0):.0f}",
+
+                f"Velocity (mm/s)  X: {data.get('vel_x_mms', 0):.1f}  "
+                f"Y: {data.get('vel_y_mms', 0):.1f}  "
+                f"Z: {data.get('vel_z_mms', 0):.1f}",
+
+                # SENSOR-TO-AXIS MAP (must match the firmware BEAM* defines):
+                #   forward sensor is wired to SHUT D5 = firmware channel 2 = d2
+                #   sideways +X sensor -> channel 1 = d1
+                #   -X sensor          -> channel 4 = d4
+                #   up +Z sensor       -> channel 3 = d3
+                # So +Y(fwd) reads d2/state2, +X reads d1/state1. This is
+                # correct and intentional - do NOT "simplify" +Y back to d1
+                # unless the forward sensor is physically moved to D4.
+                f"Range +Y (fwd): {self._fmtRange(data.get('distance_mm2', -1.0))}"
+                f"{self._fmtChannel(data, 2)}",
+
+                # X pair flipped to match wiring: channel 4 (d4) = +X,
+                #   channel 1 (d1) = -X. Keep these in sync with the firmware
+                #   BEAM1/BEAM4 X signs.
+                f"Range +X: {self._fmtRange(data.get('distance_mm4', -1.0))}"
+                f"{self._fmtChannel(data, 4)}",
+
+                f"Range -X: {self._fmtRange(data.get('distance_mm', -1.0))}"
+                f"{self._fmtChannel(data, 1)}",
+
+                f"Range +Z (up): {self._fmtRange(data.get('distance_mm3', -1.0))}"
+                f"{self._fmtChannel(data, 3)}",
+
+                f"World accel (mm/s^2)  X: {data.get('wacc_x', 0):.0f}  "
+                f"Y: {data.get('wacc_y', 0):.0f}  "
+                f"Z: {data.get('wacc_z', 0):.0f}",
+
+                f"Stationary (ZUPT): {'YES' if data.get('stationary', 0) else 'no'}",
+            ]
+        self.threeDView.cornerAnnotation().SetText(2, "\n".join(lines))
+
+    @staticmethod
+    def _fmtRange(value):
+        return "--" if value is None or value < 0 else f"{value:.0f} mm"
+
+    RANGE_STATES = {
+        0: "no target in beam",
+        1: "waiting to anchor",
+        2: "LOCKED",
+        3: "reading rejected",
+    }
+
+    @classmethod
+    def _fmtChannel(cls, data, n):
+        state = int(data.get(f"r{n}_state", 0))
+        label = cls.RANGE_STATES.get(state, "?")
+        if state == 2:
+            # Locked: sensor is trusted, correcting position (finite R).
+            return f"   {label}, innov {data.get(f'r{n}_innov', 0):+.1f} mm"
+        # Not locked: firmware has set R effectively infinite, so this sensor
+        # is IGNORED and the IMU dead-reckons this axis. Flag it loudly so the
+        # blind axis is obvious at a glance.
+        return f"   [{label}]  >>> R=inf, IGNORED (IMU only) <<<"
+
+    # --------------------------------------------------------- controls
+    def setProbes(self, visible):
+        if self.probe1 is not None:
+            self.probe1.setVisible(visible)
+            self.probe2.setVisible(visible)
+            self.probe3.setVisible(visible)
+            self.probe4.setVisible(visible)
+
+    def zeroPosition(self):
+        self.originOffset = self.rawPosition.copy()
+        self.clearTrail()
+        print("Position re-zeroed.")
+
+    def setPosition(self):
+        """Engage pivot lock: freeze the needle's ENTRY position where it is
+        right now (e.g. the moment the tip enters the patient). From here the
+        entry point stays fixed and the needle pivots about it - orientation
+        keeps updating, so the tip swings around the locked entry as you
+        change the needle's angle. Call releasePosition() to resume normal
+        position tracking."""
+        self.lockedPosition = self._clamp(self.rawPosition - self.originOffset)
+        self.positionLocked = True
+        print("Pivot LOCKED at entry {}. Needle now rotates about this point; "
+              "orientation still live. Call releasePosition() to unlock."
+              .format(np.round(self.lockedPosition, 1)))
+
+    def releasePosition(self):
+        """Release pivot lock: resume normal free position tracking."""
+        self.positionLocked = False
+        print("Pivot released - position tracking resumed.")
+
+    def zeroOrientation(self):
+        """Make the current physical pose the rest pose. After this, the
+        needle sits at its MOUNT_ROTATION default (tip along +Y, toward the
+        board) whenever the device is held the way it is right now. Hold the
+        device in the orientation you want to call 'forward', then call this."""
+        # orientOffset = R_live^-1, so R_live @ orientOffset = I at this pose.
+        self.orientOffset = self._lastRlive.T.copy()   # rotation inverse = transpose
+        print("Orientation re-zeroed. Current pose is now the rest pose "
+              "(needle points +Y toward the board).")
+
+    def zeroAll(self):
+        """Zero orientation and position together - the usual startup step."""
+        self.zeroOrientation()
+        self.zeroPosition()
+
+    def clearTrail(self):
+        if self.trail is not None:
+            self.trail.clear()
+
+    def setTrail(self, visible):
+        if self.trail is not None:
+            self.trail.setVisible(visible)
+
+    def stop(self):
+        try:
+            self.timer.stop()
+        except Exception:
+            pass
+        try:
+            self.arduinoNode.RemoveObserver(self.observerTag)
+        except Exception:
+            pass
+        print(f"GY95TController stopped after {self._samples} samples.")
+
+
+# --- Stop any controller left over from a previous paste, THEN start. ---
+_prev = globals().get("controller", None)
+if _prev is not None:
+    try:
+        _prev.stop()
+    except Exception:
+        pass
+
+controller = GY95TController()
+
+# controller.zeroPosition()
+# controller.stop()
+
+
+# ============================================================
+# ===============  PHANTOM PEGBOARD SECTION  =================
+# ============================================================
+# (runs after `controller` exists, created just above)
+
+PHANTOM_STL_PATH = None          # set to load automatically if not in scene
+PHANTOM_NODE_NAME = "phantom_pegboard"
+
+TARGETS_NODE_NAME = "PhantomTargets"
+ALLHOLES_NODE_NAME = "PhantomAllHoles"
+
+PITCH = 5.0                      # mm, fine grid
+LABEL_STEP = 10.0                # mm between labeled lines
+COLS = "ABCDEFG"                 # labeled columns (X)
+ROWS = [1, 2, 3, 4, 5, 6, 7]     # labeled rows (Y)
+
+SHOW_ALL_HOLES = False           # also mark every 5 mm hole (unlabeled)
+FRONT_Z = 0.0                    # markers sit on the front face
+
+# --- Board placement in the world ------------------------------------------
+# The needle advances along world +Y (its long axis at rest). For the needle
+# to drive INTO the grid, the board must stand across that path: grid facing
+# back along -Y, offset out along +Y.
+#
+# The STL is built with its grid on the XY plane facing +Z. Rotating it +90
+# deg about X stands it up so the grid faces -Y (toward the needle); then we
+# translate it +APPROACH_MM along +Y so it sits in front of the needle at
+# start. Grid columns A->G stay along world X; grid rows 1->7 map to world Z.
+#
+# This is the DRAW placement. labeled_coord() applies the SAME rotation +
+# offset so a marker's world position matches where the board actually is,
+# while the tracking/alignment math (which compares against these coords)
+# stays self-consistent. D4 remains the reference the needle zeroes to.
+_np = np  # alias; numpy already imported above
+
+APPROACH_MM = 200.0              # how far along +Y the board sits
+
+# +90 deg about X: sends local +Z (grid normal) to world -Y (faces needle),
+# and local +Y (rows up) to world +Z.
+_BR = _np.array([[1.0, 0.0, 0.0],
+                 [0.0, 0.0, -1.0],
+                 [0.0, 1.0, 0.0]])
+_BT = _np.array([0.0, APPROACH_MM, 0.0])
+
+
+def _place(p):
+    """Map a point from the board's build frame into its world position."""
+    return tuple(_BR @ _np.array(p, dtype=float) + _BT)
+
+
+def grid_coord(col, row):
+    """Hole position in the board's BUILD frame (D4 at origin, grid on XY)."""
+    ci = COLS.index(col)                 # 0..6, D=3
+    x = (ci - COLS.index("D")) * LABEL_STEP
+    y = (row - 4) * LABEL_STEP
+    return (x, y, FRONT_Z)
+
+
+def labeled_coord(col, row):
+    """Hole position in WORLD coordinates, i.e. where the board actually
+    sits (rotated to face the needle, offset +Y). This is what the tracking
+    tip is compared against, so it must be the placed position - not the
+    raw grid coordinate."""
+    return _place(grid_coord(col, row))
+
+
+def _find_phantom_model():
+    """Locate the loaded board model. Slicer names a model after its file,
+    so 'phantom_board' (the filename) is as likely as 'phantom_pegboard'.
+    Try known names, then fall back to any model node whose name mentions
+    'phantom' - so it attaches no matter what the STL was called."""
+    for nm in (PHANTOM_NODE_NAME, "phantom_board", "phantom", "phantom_board_1"):
+        n = slicer.mrmlScene.GetFirstNodeByName(nm)
+        if n is not None and n.IsA("vtkMRMLModelNode"):
+            return n
+    # last resort: scan all model nodes for one that looks like the phantom
+    models = slicer.util.getNodesByClass("vtkMRMLModelNode")
+    for n in models:
+        nm = (n.GetName() or "").lower()
+        if "phantom" in nm or "pegboard" in nm:
+            return n
+    return None
+
+
+def ensure_phantom_loaded():
+    node = _find_phantom_model()
+    if node is None and PHANTOM_STL_PATH:
+        node = slicer.util.loadModel(PHANTOM_STL_PATH)
+    if node is None:
+        print("Phantom board model not found in the scene. Load "
+              "phantom_board.stl (File > Add Data) BEFORE running this, or "
+              "set PHANTOM_STL_PATH at the top of the script.")
+        return None
+    node.SetName(PHANTOM_NODE_NAME)          # normalise the name
+    d = node.GetDisplayNode()
+    if d:
+        d.SetColor(0.25, 0.25, 0.28)
+        d.SetOpacity(0.85)
+    # Parent the board onto the SAME placement transform the markers use,
+    # so board + grid move as one rigid unit.
+    _apply_display_transform(node)
+    print(f"Attached board '{node.GetName()}' to the phantom placement.")
+    return node
+
+
+def _offset_transform_node():
+    """Shared transform that rotates the board to face the needle and
+    offsets it +Y. Board model and both marker sets are parented to it, so
+    everything moves together and the stored grid coords stay in the build
+    frame."""
+    name = "PhantomPlacement"
+    tnode = slicer.mrmlScene.GetFirstNodeByName(name)
+    if tnode is None:
+        import vtk
+        tnode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode", name)
+        m = vtk.vtkMatrix4x4()
+        for i in range(3):
+            for j in range(3):
+                m.SetElement(i, j, float(_BR[i, j]))
+            m.SetElement(i, 3, float(_BT[i]))
+        tnode.SetMatrixTransformToParent(m)
+    return tnode
+
+
+def _apply_display_transform(model_node):
+    model_node.SetAndObserveTransformNodeID(_offset_transform_node().GetID())
+    return _offset_transform_node()
+
+
+def _parent_to_display_offset(node):
+    node.SetAndObserveTransformNodeID(_offset_transform_node().GetID())
+
+
+def make_target_markers():
+    existing = slicer.mrmlScene.GetFirstNodeByName(TARGETS_NODE_NAME)
+    if existing is not None:
+        slicer.mrmlScene.RemoveNode(existing)
+
+    fid = slicer.mrmlScene.AddNewNodeByClass(
+        "vtkMRMLMarkupsFiducialNode", TARGETS_NODE_NAME)
+    for row in reversed(ROWS):           # 7 at top
+        for col in COLS:
+            x, y, z = grid_coord(col, row)
+            idx = fid.AddControlPoint(x, y, z)
+            fid.SetNthControlPointLabel(idx, f"{col}{row}")
+
+    d = fid.GetDisplayNode()
+    d.SetGlyphScale(2.0)
+    d.SetTextScale(2.5)
+    d.SetSelectedColor(1.0, 0.85, 0.1)
+    d.SetColor(1.0, 0.85, 0.1)
+
+    # Lock every control point AND the node itself so nothing can be
+    # dragged, nudged, or deleted by a stray click. Their coordinates are
+    # ground truth; a moved marker is a wrong measurement. Belt and
+    # braces here because the two APIs differ across Slicer versions.
+    fid.SetLocked(True)
+    fid.LockedOn()
+    for i in range(fid.GetNumberOfControlPoints()):
+        fid.SetNthControlPointLocked(i, True)
+
+    # Same visual offset as the board, so markers stay on the holes. Their
+    # stored coordinates remain the true grid values (D4 at origin) - only
+    # the drawn position shifts, via the shared transform.
+    _parent_to_display_offset(fid)
+
+    print(f"Placed {fid.GetNumberOfControlPoints()} labeled targets "
+          "(A1..G7), locked.")
+    return fid
+
+
+def make_all_hole_markers():
+    if not SHOW_ALL_HOLES:
+        return None
+    existing = slicer.mrmlScene.GetFirstNodeByName(ALLHOLES_NODE_NAME)
+    if existing is not None:
+        slicer.mrmlScene.RemoveNode(existing)
+
+    fid = slicer.mrmlScene.AddNewNodeByClass(
+        "vtkMRMLMarkupsFiducialNode", ALLHOLES_NODE_NAME)
+    n = int(round(60.0 / PITCH)) + 1     # 13
+    for j in range(n):
+        for i in range(n):
+            x = -30.0 + i * PITCH
+            y = -30.0 + j * PITCH
+            idx = fid.AddControlPoint(x, y, FRONT_Z)
+            fid.SetNthControlPointLabel(idx, "")   # unlabeled
+    d = fid.GetDisplayNode()
+    d.SetGlyphScale(0.8)
+    d.SetTextScale(0.0)
+    d.SetSelectedColor(0.4, 0.7, 1.0)
+    d.SetColor(0.4, 0.7, 1.0)
+
+    fid.SetLocked(True)
+    fid.LockedOn()
+    for i in range(fid.GetNumberOfControlPoints()):
+        fid.SetNthControlPointLocked(i, True)
+
+    _parent_to_display_offset(fid)
+
+    print(f"Placed {fid.GetNumberOfControlPoints()} fine grid markers, locked.")
+    return fid
+
+
+# --- frame alignment ------------------------------------------------------
+# Zeroing at D4 aligns the ORIGIN. It does not align rotation about the
+# needle's approach axis: the tracker's axes come from the IMU mounting, the
+# phantom's from its A->G / 1->7 grid, and the two can be rotated relative to
+# each other. The board now lies in the world X-Z plane (columns along X,
+# rows along Z), so this aligns the (X,Z) components and passes the approach
+# axis (Y) through. Measured from two known holes. Identity until calibrated.
+_ALIGN = {"R": np.eye(2), "origin": np.zeros(2), "done": False}
+
+_PLANE = (0, 2)          # grid spans world X and Z
+_THRU = 1                # approach axis (Y) passed through unchanged
+
+
+def _plane_of(p):
+    return np.array([p[_PLANE[0]], p[_PLANE[1]]])
+
+
+def _tip_world(ctrl):
+    """Needle tip position in the tracker's world frame (mm)."""
+    R = np.array([[ctrl.matrix.GetElement(i, j) for j in range(3)] for i in range(3)])
+    t = np.array([ctrl.matrix.GetElement(i, 3) for i in range(3)])
+    return R @ ctrl.tipLocal + t
+
+
+def _apply_align(p):
+    """Rotate the in-plane (X,Z) part into the phantom grid frame; pass the
+    approach axis through."""
+    uv = _ALIGN["R"] @ (_plane_of(p) - _ALIGN["origin"])
+    out = np.array(p, dtype=float)
+    out[_PLANE[0]] = uv[0]
+    out[_PLANE[1]] = uv[1]
+    return out
+
+
+def align_phantom(hole_a="D4", hole_b="G4", controller_var="controller"):
+    """Two-touch calibration. Rest the needle on hole_a, run this; it will
+    prompt you to move to hole_b and run confirm_align(). Together they
+    solve the in-plane rotation + offset that map the tracker frame onto
+    the phantom grid, so 'forward on the board' reads as forward on screen.
+
+    hole_a and hole_b should be a known distance apart along one grid line
+    (D4 -> G4 is +30 mm along +X, a good baseline)."""
+    ctrl = globals().get(controller_var)
+    if ctrl is None:
+        print(f"No '{controller_var}'. Start the tracking script first.")
+        return
+    tip = _tip_world(ctrl)
+    _ALIGN["_a_tip"] = _plane_of(tip).copy()
+    _ALIGN["_a_hole"] = _plane_of(labeled_coord(*_split(hole_a)))
+    _ALIGN["_b_hole"] = _plane_of(labeled_coord(*_split(hole_b)))
+    _ALIGN["_b_name"] = hole_b
+    print(f"Captured point A at hole {hole_a}. Now rest the needle on "
+          f"{hole_b} and run:  confirm_align()")
+
+
+def confirm_align(controller_var="controller"):
+    """Second half of align_phantom(): captures hole_b and computes the map."""
+    ctrl = globals().get(controller_var)
+    if ctrl is None or "_a_tip" not in _ALIGN:
+        print("Run align_phantom() first, at the first hole.")
+        return
+    b_tip = _plane_of(_tip_world(ctrl))
+    a_tip = _ALIGN["_a_tip"]
+    a_hole = _ALIGN["_a_hole"]
+    b_hole = _ALIGN["_b_hole"]
+
+    v_tip = b_tip - a_tip                 # baseline as the tracker saw it
+    v_hole = b_hole - a_hole              # baseline as the phantom defines it
+    if np.linalg.norm(v_tip) < 5.0:
+        print("Points too close (<5 mm). Use holes further apart.")
+        return
+
+    # Rotation that turns the tracker baseline onto the phantom baseline.
+    ang_tip = np.arctan2(v_tip[1], v_tip[0])
+    ang_hole = np.arctan2(v_hole[1], v_hole[0])
+    dth = ang_hole - ang_tip
+    c, s = np.cos(dth), np.sin(dth)
+    R = np.array([[c, -s], [s, c]])
+
+    # Origin such that phantom = R @ (tip - origin) maps hole A exactly:
+    #   a_hole = R @ (a_tip - origin)  =>  origin = a_tip - R^-1 @ a_hole
+    _ALIGN["R"] = R
+    _ALIGN["origin"] = a_tip - np.linalg.solve(R, a_hole)
+    _ALIGN["done"] = True
+
+    deg = np.degrees(dth)
+    print(f"Aligned. Tracker frame rotated {deg:+.1f} deg from the phantom grid.")
+    # sanity: map the full b_tip world point and compare its plane part
+    full_b = _tip_world(ctrl)
+    got = _plane_of(_apply_align(full_b))
+    res = np.linalg.norm(got - b_hole)
+    print(f"Check at {_ALIGN['_b_name']}: residual {res:.1f} mm "
+          f"({'good' if res < 5 else 'high - recheck the touches'}).")
+
+
+def _split(name):
+    return name[0].upper(), int(name[1:])
+
+
+# --- error readout helper -------------------------------------------------
+def controller_target(name, controller_var="controller"):
+    """Print the distance from the live needle tip to a labeled hole, in the
+    phantom grid frame (alignment applied if align_phantom() has been run)."""
+    target = np.array(labeled_coord(*_split(name)))
+
+    ctrl = globals().get(controller_var)
+    if ctrl is None:
+        print(f"No '{controller_var}' found. Is the tracking script running?")
+        return
+
+    tip_tracker = _tip_world(ctrl)
+    tip = _apply_align(tip_tracker) if _ALIGN["done"] else tip_tracker
+    err = tip - target
+    dist = float(np.linalg.norm(err))
+    frame = "phantom-aligned" if _ALIGN["done"] else "RAW (run align_phantom first)"
+    print(f"Target {name} at {tuple(target)}  [{frame}]")
+    print(f"Needle tip at ({tip[0]:.1f}, {tip[1]:.1f}, {tip[2]:.1f})")
+    print(f"Error: {dist:.1f} mm   (dx={err[0]:+.1f} dy={err[1]:+.1f} dz={err[2]:+.1f})")
+    return dist
+
+
+ensure_phantom_loaded()
+make_target_markers()
+make_all_hole_markers()
+
+
+def frame_phantom_view():
+    """Point the 3D camera down the needle's approach axis at the board,
+    so the offset pegboard is seen face-on."""
+    try:
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        view.resetFocalPoint()
+        view.resetCamera()
+        view.forceRender()
+    except Exception as exc:
+        print("view reset skipped:", exc)
+
+
+frame_phantom_view()
+print("Phantom ready, drawn 200 mm along +Z (D4 still the tracking origin).")
+print("To use it as a measurement rig:")
+print("  1. Zero the needle at D4 (press 'z' in the Serial Monitor).")
+print("  2. align_phantom('D4','G4') -> move to G4 -> confirm_align()")
+print("  3. controller_target('B6') etc. to read tip-to-hole error live.")
