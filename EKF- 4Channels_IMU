@@ -54,12 +54,6 @@
  * quick rotations could be captured downstream; 115200 removes it.
  * Slicer's serial connection MUST be set to the SAME baud (115200) or
  * the data will arrive as garbage.
- *
- * NOTE: SERIAL_BAUD below is still 9600 - this comment describes the
- * 115200 upgrade but the #define was never changed to match. Left as-is
- * (not part of this pass); PRINT_HZ stays capped around 8-10 until
- * SERIAL_BAUD is actually raised to 115200 AND the Slicer-side serial
- * connection is changed to match.
  * ------------------------------------------------------------------- */
 #define SERIAL_BAUD       9600
 #define PRINT_HZ          8
@@ -190,7 +184,13 @@
 //
 // Push lower (4, or 1) for even more trust, at the cost of the position
 // twitching with sensor noise. Raise back toward 36 if it gets jittery.
-#define RANGE_MEAS_VAR    9.0f     // (mm)^2; VL6180X close-range ~+/-3 mm
+// Base measurement variance for a LOCKED range sensor. The datasheet gives
+// +/-3 mm, which as a variance is 3^2 = 9; using 6 deliberately trusts the
+// sensor slightly MORE than datasheet-nominal (a tuning choice, not the
+// textbook value) so a locked reading pulls position a little harder.
+// See getRangeR() below - this is scaled UP when the channel is not solidly
+// locked, so an unsure or unlocked sensor is trusted far less (or ignored).
+#define RANGE_MEAS_VAR    6.0f     // (mm)^2; locked-sensor trust
 
 // Reject any correction that disagrees with the current estimate by more
 // than this. Sweeping off the edge of the target produces a sudden step
@@ -273,23 +273,25 @@
  * level, matching the actual mount. So we use the straightforward level
  * mapping:  body +X = sideways,  +Y = forward (at phantom),  +Z = up.
  *
- * Physical aim, corrected empirically (2024 run): pushing toward the
- * phantom moved channel 2's innov, not channel 1's - the mounting is the
- * opposite of what this comment used to assume. Swapped:
+ * Physical aim: sensor 1 -> phantom (forward) = body +Y.
+ *               sensor 2 -> sideways           = body +X.
  *
- *   sensor 1 -> sideways           = body +X.
- *   sensor 2 -> phantom (forward)  = body +Y.
+ * rotateBodyToWorld() maps these to world axes each sample. Verify
+ * empirically: push toward the phantom and channel 2's innov should move;
+ * push sideways and channel 1's should. If swapped, exchange the blocks.
  *
- * rotateBodyToWorld() maps these to world axes each sample. If your own
- * mount disagrees, re-verify the same way: push toward the phantom and
- * channel 2's innov should move; push sideways and channel 1's should.
+ * WIRING NOTE: the FORWARD sensor is physically on SHUT pin D5 = channel 2,
+ * and the sideways (-X) partner logic is on channel 1 (D4). So channel 2
+ * carries the +Y forward beam and channel 1 carries the +X beam. This
+ * matches the real hardware; do NOT "correct" it back without re-checking
+ * which SHUT pin the forward sensor is actually on.
  * ------------------------------------------------------------------- */
-#define BEAM1_BODY_X  1.0f      // sensor 1 -> +X (sideways)
+#define BEAM1_BODY_X -1.0f      // channel 1 (D4) -> -X (sideways) [flipped to match wiring]
 #define BEAM1_BODY_Y  0.0f
 #define BEAM1_BODY_Z  0.0f
 
 #define BEAM2_BODY_X  0.0f
-#define BEAM2_BODY_Y  1.0f      // sensor 2 -> +Y (forward, at phantom)
+#define BEAM2_BODY_Y  1.0f      // channel 2 (D5) -> +Y (forward, at phantom)
 #define BEAM2_BODY_Z  0.0f
 
 // Sensor 3 disconnected; left defined so the struct/serial stay intact.
@@ -297,11 +299,11 @@
 #define BEAM3_BODY_Y  0.0f
 #define BEAM3_BODY_Z  1.0f      // would be +Z (up) if reconnected
 
-// Sensor 4: points the OPPOSITE way to sensor 1 along X (i.e. body -X).
-// Together s1 (+X) and s4 (-X) form a differential pair: a leftward move
-// makes one beam's distance shrink while the other's grows by the same
-// amount, so combining them cancels common-mode error on the X axis.
-#define BEAM4_BODY_X -1.0f
+// X differential pair (channels 1 and 4 point opposite ways along X).
+// FLIPPED to match wiring: channel 1 = -X, channel 4 = +X. They still form
+// the differential pair - a sideways move shrinks one beam and grows the
+// other by the same amount, cancelling common-mode error on the X axis.
+#define BEAM4_BODY_X  1.0f      // channel 4 -> +X [flipped to match wiring]
 #define BEAM4_BODY_Y  0.0f
 #define BEAM4_BODY_Z  0.0f
 
@@ -531,58 +533,15 @@ PosVelKF kf_pos_x, kf_pos_y, kf_pos_z;
  *
  * Full 9-DOF as requested. Sized for the UNO: state 7, P is 7x7 (196 B),
  * ~750 B working set total. Position stays in the separate linear KF.
- *
- * WHY ROLL/PITCH ONLY BY DEFAULT: (b) needs an absolute world reference
- * for yaw, which the magnetometer is supposed to supply, but that only
- * works once two separate problems are solved - see USE_EKF_MAG_YAW
- * below. Until then the EKF corrects roll/pitch (the axes that decide
- * how precisely the needle's ANGLE is tracked) and yaw is left to the
- * GY-95T's own pre-fused output, same as before.
  * ------------------------------------------------------------------- */
-#define USE_ORIENTATION_EKF 1   // ON: fuse gyro + accel into our own
-                                //  quaternion for roll/pitch. Continuous
-                                //  gravity-vector correction bounds the
-                                //  gyro-integration error that pure
-                                //  integration accumulates while the
-                                //  needle is held at an angle, and the
-                                //  bias states (bx/by/bz) let the filter
-                                //  learn and subtract the gyro's own
-                                //  steady-state drift over time - this is
-                                //  the actual fix for "moves at an angle,
-                                //  drifts, doesn't track precisely."
-
-// Whether the EKF ALSO corrects yaw from the magnetometer. OFF by default -
-// two real problems have to be solved first, not just left for later:
-//   1. FRAME MISMATCH. The mag correction assumes world +X is magnetic
-//      north. Everything else in this sketch (ZERO_YAW_AT_START,
-//      BEAM1/BEAM2_BODY_*) defines world axes as "wherever the device was
-//      pointing at power-on" - essentially never magnetic north. Turn mag
-//      yaw on without fixing this and the EKF spends every sample
-//      dragging yaw toward compass north while the range-correction beams
-//      stay wired to the power-on heading; the two disagree more the
-//      further apart those two directions happen to be.
-//   2. NO HARD/SOFT-IRON CALIBRATION. my_95Q.mag_x/y/z are raw. On a
-//      small board like this they are dominated by local anomalies
-//      (traces, nearby metal), not the earth's field, so an uncalibrated
-//      absolute yaw correction can inject more error than it removes.
-// Until both are solved, yaw is left alone: only roll/pitch - the axes
-// that actually decide needle-tilt precision - come from the EKF; yaw
-// keeps coming from the GY-95T's own pre-fused fusion (referencedYaw()),
-// same as when the EKF is off.
-#define USE_EKF_MAG_YAW      0
+#define USE_ORIENTATION_EKF 0   // OFF: use GY-95T pre-fused angles (no drift).
+                                //  The EKF code below stays dormant; set to 1
+                                //  only after calibrating the magnetometer.
 
 OriEKF ekf;
 // EKF Euler output, published for the serial printer (which runs in a
 // separate function and can't see the update's locals).
 float g_ori_roll = 0, g_ori_pitch = 0, g_ori_yaw = 0;
-// Yaw value the EKF itself reported right after ekfSeedFromAccelMag() ran,
-// captured once so a later "zero yaw at start" subtraction stays inside
-// the EKF's OWN reference frame. yaw_ref_deg (below) is captured from the
-// GY-95T's separate internal fusion during calibrate() and lives in a
-// different frame (mag-referenced vs. whatever the module's fusion calls
-// zero) - subtracting one from the other produces a meaningless offset.
-// Only used if USE_EKF_MAG_YAW is ever turned on.
-float ekf_yaw_ref_deg = 0.0f;
 
 static void ekf_normalize(OriEKF *f)
 {
@@ -957,6 +916,26 @@ void correctAxisAlongBeam(PosVelKF *kf, float u, float innov, float S)
     kf->P[1][1] -= K1 * HP1;
 }
 
+// Effective measurement variance (R) for a channel, scaled by how much we
+// trust it right now. Your idea: when a sensor isn't solidly locked on a
+// target, its reading is unreliable, so we inflate R a LOT (or effectively
+// drop it) - which makes the Kalman gain tiny and lets the IMU dead-reckon
+// instead of being yanked by a bad range value.
+//   state 2 (locked)   -> full trust, R = base
+//   state 1 (settling) -> low trust,  R = base x 25  (weak correction)
+//   state 3 (rejected) / anything else / not anchored -> essentially ignored
+// Returns a very large R for untrusted channels so their correction is
+// negligible without needing a separate code path.
+float getRangeR(const RangeChannel *ch)
+{
+    if (!ch->anchored)      return 1.0e9f;      // no anchor: ignore entirely
+    switch (ch->state) {
+        case 2:  return RANGE_MEAS_VAR;         // locked: full trust
+        case 1:  return RANGE_MEAS_VAR * 25.0f; // settling: weak trust
+        default: return 1.0e9f;                 // rejected/idle: ignore
+    }
+}
+
 // Anchor, gate and apply one channel along its own beam.
 // `stationary` comes from the IMU. When true we trust the accelerometer's
 // verdict (no motion) over the rangefinder, because a range change while
@@ -1020,32 +999,6 @@ void updateRangeChannel(RangeChannel *ch, float ux, float uy, float uz,
 
     ch->innov = (ch->anchor_C - d) - p_along;
 
-    // --- Anti-occlusion guard: re-baseline instead of correcting ----------
-    // A range change while the IMU insists we are NOT moving can only be
-    // the target changing (a hand, tissue, whatever entered the beam), not
-    // real motion. Without this, that change gets applied as a position
-    // correction and the needle visibly slides toward whatever just
-    // blocked the sensor - even after ZUPT has zeroed velocity, because
-    // ZUPT does not touch position and runs AFTER this correction anyway.
-    //
-    // This is deliberately narrower than "never correct while stationary":
-    // a slow forward push produces almost no acceleration, so the IMU
-    // still reports stationary, and rebaselining on every sample in that
-    // case would make the push invisible (the sensor watches you approach
-    // while the code keeps calling the new distance "zero"). RANGE_CREEP_MM
-    // is what tells the two apart - bigger than that per sample, and it
-    // gets corrected even though the IMU calls it stationary.
-#if RANGE_TRUST_WHILE_MOVING_ONLY
-    float creep = fabs(d - ch->prev_mm);
-    if (stationary && creep < RANGE_CREEP_MM) {
-        ch->anchor_C = p_along + d;   // truly still: adopt reading as zero
-        ch->innov = 0.0f;
-        ch->state = 2;
-        ch->reject_count = 0;
-        return;
-    }
-#endif
-
     // --- Apply only when the innovation is above the noise floor ---------
     // innov is the accumulated disagreement between what the range sensor
     // measures and what the position estimate predicts, measured from the
@@ -1072,16 +1025,17 @@ void updateRangeChannel(RangeChannel *ch, float ux, float uy, float uz,
         return;
     }
     ch->reject_count = 0;
+    ch->state = 2;   // reached a valid correction: mark locked BEFORE computing
+                     // R, so getRangeR() reports full trust for this update.
 
     float S = ux * ux * kf_pos_x.P[0][0]
             + uy * uy * kf_pos_y.P[0][0]
             + uz * uz * kf_pos_z.P[0][0]
-            + RANGE_MEAS_VAR;
+            + getRangeR(ch);     // adaptive: full trust locked, huge R if not
 
     correctAxisAlongBeam(&kf_pos_x, ux, ch->innov, S);
     correctAxisAlongBeam(&kf_pos_y, uy, ch->innov, S);
     correctAxisAlongBeam(&kf_pos_z, uz, ch->innov, S);
-    ch->state = 2;
 }
 
 void resetChannel(RangeChannel *ch)
@@ -1093,32 +1047,30 @@ void resetChannel(RangeChannel *ch)
     ch->prev_mm = -1.0f;
 }
 
-// roll_deg/pitch_deg/yaw_deg: the FUSED orientation to rotate each beam by.
-// Callers pass ori_roll/ori_pitch/ori_yaw (the EKF's roll/pitch when
-// USE_ORIENTATION_EKF is on, the GY-95T's own fusion otherwise) - NOT
-// my_95Q.roll/pitch directly, so any orientation-precision improvement
-// (the EKF) actually reaches the beams that project range readings onto
-// world axes. Previously this read my_95Q.roll/pitch unconditionally, so
-// enabling the EKF improved the *dead-reckoned* position but left the
-// range-aided correction itself keyed to the old, drift-prone angles.
-void applyRangeCorrection(bool is_stationary,
-                          float roll_deg, float pitch_deg, float yaw_deg)
+void applyRangeCorrection(bool is_stationary)
 {
     // Rotate each beam from the body frame into the world frame using the
     // current fused orientation. This keeps every correction landing on
     // the right world axis even as the syringe tilts and turns.
     float u1x, u1y, u1z, u2x, u2y, u2z, u3x, u3y, u3z;
     rotateBodyToWorld(ch1.bx, ch1.by, ch1.bz,
-                      roll_deg, pitch_deg, yaw_deg, &u1x, &u1y, &u1z);
+                      my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
+                      referencedYaw(), &u1x, &u1y, &u1z);
     rotateBodyToWorld(ch2.bx, ch2.by, ch2.bz,
-                      roll_deg, pitch_deg, yaw_deg, &u2x, &u2y, &u2z);
+                      my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
+                      referencedYaw(), &u2x, &u2y, &u2z);
     rotateBodyToWorld(ch3.bx, ch3.by, ch3.bz,
-                      roll_deg, pitch_deg, yaw_deg, &u3x, &u3y, &u3z);
+                      my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
+                      referencedYaw(), &u3x, &u3y, &u3z);
     float u4x, u4y, u4z;
     rotateBodyToWorld(ch4.bx, ch4.by, ch4.bz,
-                      roll_deg, pitch_deg, yaw_deg, &u4x, &u4y, &u4z);
+                      my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
+                      referencedYaw(), &u4x, &u4y, &u4z);
 
-    // --- X-axis differential pair: sensor 1 (+X) and sensor 4 (-X) --------
+    if (dist1_mm >= 0.0f) updateRangeChannel(&ch1, u1x, u1y, u1z, dist1_mm, is_stationary);
+    else                  resetChannel(&ch1);
+
+    // --- X-axis differential pair: sensor 2 (+X) and sensor 4 (-X) --------
     // They face opposite ways, so a leftward move shrinks one beam's range
     // and grows the other's by the same amount. Both channels correct the
     // SAME world X axis (updateRangeChannel projects each beam onto its own
@@ -1126,14 +1078,11 @@ void applyRangeCorrection(bool is_stationary,
     // their independent noise average out - a true differential measurement
     // that cancels error common to both. When only one sees a surface, that
     // one still corrects alone (redundancy / blind-spot coverage).
-    if (dist1_mm >= 0.0f) updateRangeChannel(&ch1, u1x, u1y, u1z, dist1_mm, is_stationary);
-    else                  resetChannel(&ch1);
+    if (dist2_mm >= 0.0f) updateRangeChannel(&ch2, u2x, u2y, u2z, dist2_mm, is_stationary);
+    else                  resetChannel(&ch2);
 
     if (dist4_mm >= 0.0f) updateRangeChannel(&ch4, u4x, u4y, u4z, dist4_mm, is_stationary);
     else                  resetChannel(&ch4);
-
-    if (dist2_mm >= 0.0f) updateRangeChannel(&ch2, u2x, u2y, u2z, dist2_mm, is_stationary);
-    else                  resetChannel(&ch2);
 
     if (dist3_mm >= 0.0f) updateRangeChannel(&ch3, u3x, u3y, u3z, dist3_mm, is_stationary);
     else                  resetChannel(&ch3);
@@ -1162,6 +1111,11 @@ bool sampleReady()
 // position metres off. This is a SEATBELT, not a fix - proper pull-up
 // resistors on SDA/SCL are the real cure - but it stops one bad read from
 // destroying the whole track.
+// Master switch for the corruption guard. Default OFF - it was rejecting
+// good data on some setups, and a rejected-everything guard is worse than
+// no guard. Turn ON only if you see position explode from bus corruption,
+// and watch the "# corrupt reason=" line to confirm it's catching real
+// garbage and not eating clean samples.
 // Guard ON, but only the SAFE checks. Last time it rejected good data
 // because the accel/mag bounds were too tight; those are now widened and,
 // more importantly, the PRIMARY check is the one that never false-fires:
@@ -1238,7 +1192,6 @@ void serviceSerialCommands()
             resetChannel(&ch1);
             resetChannel(&ch2);
             resetChannel(&ch3);
-            resetChannel(&ch4);
 #if VERBOSE_STARTUP
             Serial.println(F("# Re-anchoring range reference..."));
 #endif
@@ -1249,7 +1202,6 @@ void serviceSerialCommands()
             resetChannel(&ch1);
             resetChannel(&ch2);
             resetChannel(&ch3);
-            resetChannel(&ch4);
 #if VERBOSE_STARTUP
             Serial.println(F("# Position zeroed."));
 #endif
@@ -1486,13 +1438,10 @@ void loop()
     float gyro_y_filt = kalmanUpdate(&kf_gyro_y, gyro_y_dps);
     float gyro_z_filt = kalmanUpdate(&kf_gyro_z, gyro_z_dps);
 
-    // --- Orientation EKF: fuse gyro + accel into a quaternion for
-    // roll/pitch -------------------------------------------------------
-    // Replaces the GY-95T's pre-fused roll/pitch with our own estimate, so
-    // gyro-bias drift is learned/removed and fast angular motion is
-    // tracked from the raw gyro at full rate instead of whatever the
-    // module's internal fusion does. Yaw is deliberately NOT taken from
-    // here unless USE_EKF_MAG_YAW is on - see that macro's comment.
+    // --- Orientation EKF: fuse gyro + accel + mag into a quaternion ------
+    // Replaces the GY-95T's pre-fused angles with our own 9-DOF estimate,
+    // so gyro-bias drift is learned/removed and fast rotation is tracked
+    // from the raw gyro at full rate.
 #if USE_ORIENTATION_EKF
     float ekf_roll, ekf_pitch, ekf_yaw;
     {
@@ -1504,33 +1453,17 @@ void loop()
             ekfSeedFromAccelMag(&ekf, acc_x_g, acc_y_g, acc_z_g,
                                 (float)my_95Q.mag_x, (float)my_95Q.mag_y,
                                 (float)my_95Q.mag_z);
-            // Zero yaw against the EKF's OWN seed, not yaw_ref_deg - that is
-            // captured from the GY-95T's separate internal fusion during
-            // calibrate() and lives in a different reference frame. Only
-            // matters if USE_EKF_MAG_YAW is later turned on.
-            ekfEuler(&ekf, &ekf_roll, &ekf_pitch, &ekf_yaw);
-            ekf_yaw_ref_deg = ekf_yaw;
         }
         ekfPredict(&ekf, gx, gy, gz, dt);
         ekfCorrectVector(&ekf, acc_x_g, acc_y_g, acc_z_g,
                          0.0f, 0.0f, GRAVITY_SIGN * 1.0f, ekf.Ra);
-#if USE_EKF_MAG_YAW
         ekfCorrectVector(&ekf, (float)my_95Q.mag_x, (float)my_95Q.mag_y,
                          (float)my_95Q.mag_z, 1.0f, 0.0f, 0.0f, ekf.Rm);
-#endif
         ekfEuler(&ekf, &ekf_roll, &ekf_pitch, &ekf_yaw);
     }
     float ori_roll  = ekf_roll;
     float ori_pitch = ekf_pitch;
-#if USE_EKF_MAG_YAW
-    float ori_yaw   = ekf_yaw - ekf_yaw_ref_deg;
-#else
-    // Mag-yaw correction is off, so the EKF's own yaw is pure gyro
-    // integration with no absolute reference - exactly the drift we're
-    // trying to remove. Keep using the GY-95T's own pre-fused yaw instead;
-    // only roll/pitch come from the EKF.
-    float ori_yaw   = referencedYaw();
-#endif
+    float ori_yaw   = ekf_yaw - yaw_ref_deg;   // keep start-yaw zeroing
 #else
     float ori_roll  = my_95Q.roll  / 100.0f;
     float ori_pitch = my_95Q.pitch / 100.0f;
@@ -1566,7 +1499,7 @@ void loop()
     posvelPredict(&kf_pos_z, world_az, dt, Q_ACCEL_VAR);
 
 #if USE_RANGE_CORRECTION
-    applyRangeCorrection(is_stationary, ori_roll, ori_pitch, ori_yaw);
+    applyRangeCorrection(is_stationary);
 #endif
 
     if (is_stationary) {
@@ -1616,13 +1549,13 @@ void loop()
         Serial.print(F(",mz:")); Serial.print(my_95Q.mag_z);
         break;
     case 3:
-        // Channel 1 (X / sideways): distance, state, innovation.
+        // Channel 1 (X / right): distance, state, innovation.
         Serial.print(F(",d1:"));  Serial.print(dist1_mm, 0);
         Serial.print(F(",r1s:")); Serial.print(ch1.state);
         Serial.print(F(",r1i:")); Serial.print(ch1.innov, 1);
         break;
     case 4:
-        // Channel 2 (Y / forward, at phantom): distance, state, innovation.
+        // Channel 2 (Y / forward): distance, state, innovation.
         Serial.print(F(",d2:"));  Serial.print(dist2_mm, 0);
         Serial.print(F(",r2s:")); Serial.print(ch2.state);
         Serial.print(F(",r2i:")); Serial.print(ch2.innov, 1);
