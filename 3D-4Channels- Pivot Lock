@@ -487,9 +487,21 @@ class GY95TController:
 
     # ---------------------------------------------------------- observer
     def onArduinoDataUpdated(self, caller, event):
-        """Copy and return. No VTK calls, no rendering, no exceptions."""
+        """Copy and return. No VTK calls, no rendering, no exceptions.
+        ACCUMULATE payloads: serial lines arrive faster than the timer ticks,
+        and the secondary values (world accel, ranges, temp...) rotate one
+        group per line. If we kept only the latest payload we would drop ~7
+        of every 8 lines and those rotating groups would almost never update
+        (this is why World accel read 0). Appending every payload and merging
+        them all on the next tick fixes that."""
         try:
-            self._pending = read_arduino_payload(self.arduinoNode)
+            p = read_arduino_payload(self.arduinoNode)
+            if p is not None:
+                if self._pending is None:
+                    self._pending = p
+                else:
+                    # keep them as one blob; parse_line handles multiple lines
+                    self._pending = self._pending + "\n" + p
         except Exception:
             pass
 
