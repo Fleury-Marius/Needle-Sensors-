@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Wed Aug 19 10:58:59 2026
-
-@author: mariofleury
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 MERGED Slicer script: GY-95T needle tracking + phantom pegboard, in one paste.
 
 Paste this whole thing into Slicer's Python Interactor after:
@@ -73,6 +65,12 @@ POS_X_RANGE = (-250.0, 250.0)
 POS_Y_RANGE = (-200.0, 200.0)
 POS_Z_RANGE = (-100.0, 1000.0)
 
+# Auto-stop if position stays CLAMPED (pinned at a range limit) continuously
+# for this many seconds. A brief clamp spike is ignored - only a sustained
+# clamp, meaning tracking has genuinely lost its way, halts the session.
+# Set 0 to disable auto-stop entirely.
+CLAMP_STOP_SECONDS = 4.0
+
 # --------------------------------------------------------------- trail
 SHOW_TRAIL        = True
 TRAIL_MAX_POINTS  = 1500
@@ -103,7 +101,7 @@ SENSOR2_LOCAL_POS = (0.0, 0.0, 130.0)
 SENSOR2_LOCAL_DIR = (-1.0, 0.0, 0.0)    # probe shows d1 = -X now (local -X) [flipped]
 SENSOR3_LOCAL_POS = (0.0, 0.0, 125.0)
 SENSOR3_LOCAL_DIR = (0.0, -1.0, 0.0)    # ch3 -> world +Z, up (local -Y -> world +Z)
-SENSOR4_LOCAL_POS = (0.0, 0.0, 125.0)
+SENSOR4_LOCAL_POS = (0.0, 0.0, 128.0)
 SENSOR4_LOCAL_DIR = (1.0, 0.0, 0.0)     # probe shows d4 = +X now (local +X) [flipped]
 
 PROBE_MAX_MM    = 250.0
@@ -131,7 +129,7 @@ KEY_MAP = {
     "r2s": "r2_state", "r2i": "r2_innov",
     "d3": "distance_mm3", "r3s": "r3_state", "r3i": "r3_innov",
     "d4": "distance_mm4", "r4s": "r4_state", "r4i": "r4_innov",
-    "tp": "temp",  "st": "stationary",
+    "tp": "temp",   "lv": "leve",   "st": "stationary",
 }
 
 
@@ -456,6 +454,7 @@ class GY95TController:
         self.orientOffset = np.eye(3)   # identity until zeroOrientation()
         self._lastRlive = np.eye(3)
         self.clamped = False
+        self._clampStartedAt = None   # time.time() when clamping began, or None
         self._warnedNoPosition = False
 
         self.state = {}             # merged field values across lines
@@ -570,6 +569,24 @@ class GY95TController:
             position = self._clamp(self.rawPosition - self.originOffset)
         R = self._applyTransform(R_live, position)
 
+        # Sustained-clamp auto-stop: if position stays clamped continuously
+        # for CLAMP_STOP_SECONDS, tracking has lost its way - stop. A brief
+        # clamp resets the timer, so momentary spikes are ignored. Pivot-lock
+        # is exempt (position is intentionally frozen there, not drifting).
+        if CLAMP_STOP_SECONDS > 0 and not self.positionLocked:
+            if self.clamped:
+                now = time.time()
+                if self._clampStartedAt is None:
+                    self._clampStartedAt = now
+                elif now - self._clampStartedAt >= CLAMP_STOP_SECONDS:
+                    print("Position CLAMPED for {:.0f}s - tracking lost, stopping. "
+                          "Re-run the script to restart."
+                          .format(CLAMP_STOP_SECONDS))
+                    self.stop()
+                    return
+            else:
+                self._clampStartedAt = None   # cleared: not clamped now
+
         if self.trail is not None and SHOW_TRAIL:
             tipWorld = R @ (self.tipLocal - self.pivot) + self.pivot + position
             self.trail.add(tipWorld)
@@ -640,6 +657,8 @@ class GY95TController:
         if not BOX_COMPACT:
             lines += [
                 f"Temp: {data.get('temp', 0):.2f} C   "
+                f"Level: {data.get('leve', 0):.0f}",
+
                 f"Velocity (mm/s)  X: {data.get('vel_x_mms', 0):.1f}  "
                 f"Y: {data.get('vel_y_mms', 0):.1f}  "
                 f"Z: {data.get('vel_z_mms', 0):.1f}",
