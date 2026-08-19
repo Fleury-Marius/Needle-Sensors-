@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+Created on Wed Aug 19 10:58:59 2026
+
+@author: mariofleury
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
 MERGED Slicer script: GY-95T needle tracking + phantom pegboard, in one paste.
 
 Paste this whole thing into Slicer's Python Interactor after:
@@ -95,7 +103,7 @@ SENSOR2_LOCAL_POS = (0.0, 0.0, 130.0)
 SENSOR2_LOCAL_DIR = (-1.0, 0.0, 0.0)    # probe shows d1 = -X now (local -X) [flipped]
 SENSOR3_LOCAL_POS = (0.0, 0.0, 125.0)
 SENSOR3_LOCAL_DIR = (0.0, -1.0, 0.0)    # ch3 -> world +Z, up (local -Y -> world +Z)
-SENSOR4_LOCAL_POS = (0.0, 0.0, 128.0)
+SENSOR4_LOCAL_POS = (0.0, 0.0, 125.0)
 SENSOR4_LOCAL_DIR = (1.0, 0.0, 0.0)     # probe shows d4 = +X now (local +X) [flipped]
 
 PROBE_MAX_MM    = 250.0
@@ -123,7 +131,7 @@ KEY_MAP = {
     "r2s": "r2_state", "r2i": "r2_innov",
     "d3": "distance_mm3", "r3s": "r3_state", "r3i": "r3_innov",
     "d4": "distance_mm4", "r4s": "r4_state", "r4i": "r4_innov",
-    "tp": "temp",   "lv": "leve",   "st": "stationary",
+    "tp": "temp",  "st": "stationary",
 }
 
 
@@ -492,7 +500,7 @@ class GY95TController:
         and the secondary values (world accel, ranges, temp...) rotate one
         group per line. If we kept only the latest payload we would drop ~7
         of every 8 lines and those rotating groups would almost never update
-        (this is why World accel read 0). Appending every payload and merging
+        (rotating groups were being dropped). Appending every payload and merging
         them all on the next tick fixes that."""
         try:
             p = read_arduino_payload(self.arduinoNode)
@@ -632,8 +640,6 @@ class GY95TController:
         if not BOX_COMPACT:
             lines += [
                 f"Temp: {data.get('temp', 0):.2f} C   "
-                f"Level: {data.get('leve', 0):.0f}",
-
                 f"Velocity (mm/s)  X: {data.get('vel_x_mms', 0):.1f}  "
                 f"Y: {data.get('vel_y_mms', 0):.1f}  "
                 f"Z: {data.get('vel_z_mms', 0):.1f}",
@@ -660,10 +666,6 @@ class GY95TController:
 
                 f"Range +Z (up): {self._fmtRange(data.get('distance_mm3', -1.0))}"
                 f"{self._fmtChannel(data, 3)}",
-
-                f"World accel (mm/s^2)  X: {data.get('wacc_x', 0):.0f}  "
-                f"Y: {data.get('wacc_y', 0):.0f}  "
-                f"Z: {data.get('wacc_z', 0):.0f}",
 
                 f"Stationary (ZUPT): {'YES' if data.get('stationary', 0) else 'no'}",
             ]
