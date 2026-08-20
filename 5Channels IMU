@@ -46,14 +46,10 @@
  * fifth of the rate. The Slicer script merges the fields as they arrive,
  * so the corner box shows all of them and nothing reads as zero.
  *
- * Budget: core ~51 bytes + extras ~25 = ~78 bytes per line.
- *  At 115200 baud (~11520 B/s):
- *   40 Hz -> ~3120 B/s, 27% of the link. Comfortable, 5x the old detail.
- *   60 Hz -> ~4680 B/s, 41%. Also fine if you want even finer resolution.
- * The old 9600-baud limit (max ~10 Hz) was the real cap on how finely
- * quick rotations could be captured downstream; 115200 removes it.
- * Slicer's serial connection MUST be set to the SAME baud (115200) or
- * the data will arrive as garbage.
+ * Budget: core ~51 bytes + extras ~25 = ~78 bytes per line. At the
+ * current 9600 baud, PRINT_HZ must stay low enough that Serial.print()
+ * does not block the integration loop. If you raise SERIAL_BAUD later,
+ * set Slicer's ArduinoConnect connection to the exact same baud.
  * ------------------------------------------------------------------- */
 #define SERIAL_BAUD       9600
 #define PRINT_HZ          8
@@ -86,6 +82,7 @@
 //   yaw ~ atan2(d5 - d2, SEPARATION)
 #define FWD_PAIR_SEPARATION_MM  15.0f
 #define RANGE_PERIOD_MS   50       // continuous-mode period, multiple of 10
+#define RANGE_STALE_MS    (RANGE_PERIOD_MS * 4UL + 50UL)
 
 // VL6180X range scaling. The part is designed for short range and this is
 // the lever that trades resolution for reach:
@@ -444,6 +441,16 @@ float dist4_mm = -1.0f;
 float dist5_mm = -1.0f;
 int   dist1_raw = -1;
 int   dist2_raw = -1;
+bool  dist1_fresh = false;
+bool  dist2_fresh = false;
+bool  dist3_fresh = false;
+bool  dist4_fresh = false;
+bool  dist5_fresh = false;
+unsigned long dist1_ms = 0;
+unsigned long dist2_ms = 0;
+unsigned long dist3_ms = 0;
+unsigned long dist4_ms = 0;
+unsigned long dist5_ms = 0;
 bool  sensor1_present = false;
 bool  sensor2_present = false;
 bool  sensor3_present = false;
@@ -583,7 +590,9 @@ PosVelKF kf_pos_x, kf_pos_y, kf_pos_z;
                                 //  The EKF code below stays dormant; set to 1
                                 //  only after calibrating the magnetometer.
 
+#if USE_ORIENTATION_EKF
 OriEKF ekf;
+#endif
 // EKF Euler output, published for the serial printer (which runs in a
 // separate function and can't see the update's locals).
 float g_ori_roll = 0, g_ori_pitch = 0, g_ori_yaw = 0;
@@ -848,22 +857,33 @@ bool rangePoll(VL6180X &s, int *out_mm)
 void serviceRangeSensors()
 {
     int mm;
+    unsigned long now = millis();
     if (sensor1_present && rangePoll(sensor1, &mm)) {
         dist1_raw = mm;
         dist1_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist, (float)mm);
+        dist1_fresh = true;
+        dist1_ms = now;
     }
     if (sensor2_present && rangePoll(sensor2, &mm)) {
         dist2_raw = mm;
         dist2_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist2, (float)mm);
+        dist2_fresh = true;
+        dist2_ms = now;
     }
     if (sensor3_present && rangePoll(sensor3, &mm)) {
         dist3_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist3, (float)mm);
+        dist3_fresh = true;
+        dist3_ms = now;
     }
     if (sensor4_present && rangePoll(sensor4, &mm)) {
         dist4_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist4, (float)mm);
+        dist4_fresh = true;
+        dist4_ms = now;
     }
     if (sensor5_present && rangePoll(sensor5, &mm)) {
         dist5_mm  = (mm < 0) ? -1.0f : kalmanUpdate(&kf_dist5, (float)mm);
+        dist5_fresh = true;
+        dist5_ms = now;
     }
 }
 
@@ -1132,6 +1152,36 @@ void resetChannel(RangeChannel *ch)
     ch->stable_since_ms = 0;
     ch->last_mm = -1.0f;
     ch->prev_mm = -1.0f;
+    ch->innov = 0.0f;
+    ch->reject_count = 0;
+}
+
+void resetAllRangeChannels()
+{
+    resetChannel(&ch1);
+    resetChannel(&ch2);
+    resetChannel(&ch3);
+    resetChannel(&ch4);
+    resetChannel(&ch5);
+    dist1_fresh = dist2_fresh = dist3_fresh = dist4_fresh = dist5_fresh = false;
+}
+
+void consumeRangeSample(RangeChannel *ch, float ux, float uy, float uz,
+                        float d, bool *fresh, unsigned long last_ms,
+                        bool stationary)
+{
+    if (*fresh) {
+        *fresh = false;
+        if (d >= 0.0f) updateRangeChannel(ch, ux, uy, uz, d, stationary);
+        else           resetChannel(ch);
+        return;
+    }
+
+    // A locked channel with no recent fresh samples is stale. Drop the lock
+    // instead of letting an old distance keep suppressing position leakage.
+    if (ch->anchored && millis() - last_ms > RANGE_STALE_MS) {
+        resetChannel(ch);
+    }
 }
 
 void applyRangeCorrection(bool is_stationary)
@@ -1158,8 +1208,7 @@ void applyRangeCorrection(bool is_stationary)
                       my_95Q.roll / 100.0f, my_95Q.pitch / 100.0f,
                       referencedYaw(), &u5x, &u5y, &u5z);
 
-    if (dist1_mm >= 0.0f) updateRangeChannel(&ch1, u1x, u1y, u1z, dist1_mm, is_stationary);
-    else                  resetChannel(&ch1);
+    consumeRangeSample(&ch1, u1x, u1y, u1z, dist1_mm, &dist1_fresh, dist1_ms, is_stationary);
 
     // --- X-axis differential pair: sensor 2 (+X) and sensor 4 (-X) --------
     // They face opposite ways, so a leftward move shrinks one beam's range
@@ -1169,20 +1218,16 @@ void applyRangeCorrection(bool is_stationary)
     // their independent noise average out - a true differential measurement
     // that cancels error common to both. When only one sees a surface, that
     // one still corrects alone (redundancy / blind-spot coverage).
-    if (dist2_mm >= 0.0f) updateRangeChannel(&ch2, u2x, u2y, u2z, dist2_mm, is_stationary);
-    else                  resetChannel(&ch2);
+    consumeRangeSample(&ch2, u2x, u2y, u2z, dist2_mm, &dist2_fresh, dist2_ms, is_stationary);
 
-    if (dist4_mm >= 0.0f) updateRangeChannel(&ch4, u4x, u4y, u4z, dist4_mm, is_stationary);
-    else                  resetChannel(&ch4);
+    consumeRangeSample(&ch4, u4x, u4y, u4z, dist4_mm, &dist4_fresh, dist4_ms, is_stationary);
 
     // Second forward (+Y) sensor - independent channel (redundancy + noise
     // averaging on forward). Its DIFFERENCE from ch2 gives surface yaw angle,
     // computed/printed separately, not applied as a position correction.
-    if (dist5_mm >= 0.0f) updateRangeChannel(&ch5, u5x, u5y, u5z, dist5_mm, is_stationary);
-    else                  resetChannel(&ch5);
+    consumeRangeSample(&ch5, u5x, u5y, u5z, dist5_mm, &dist5_fresh, dist5_ms, is_stationary);
 
-    if (dist3_mm >= 0.0f) updateRangeChannel(&ch3, u3x, u3y, u3z, dist3_mm, is_stationary);
-    else                  resetChannel(&ch3);
+    consumeRangeSample(&ch3, u3x, u3y, u3z, dist3_mm, &dist3_fresh, dist3_ms, is_stationary);
 }
 #endif  // USE_RANGE_CORRECTION
 
@@ -1286,9 +1331,7 @@ void serviceSerialCommands()
     while (Serial.available()) {
         char c = Serial.read();
         if (c == 'a' || c == 'A') {
-            resetChannel(&ch1);
-            resetChannel(&ch2);
-            resetChannel(&ch3);
+            resetAllRangeChannels();
 #if VERBOSE_STARTUP
             Serial.println(F("# Re-anchoring range reference..."));
 #endif
@@ -1296,9 +1339,7 @@ void serviceSerialCommands()
             posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
             posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
             posvelInit(&kf_pos_z, 0.0f, 0.0f, 1.0f, 1.0f);
-            resetChannel(&ch1);
-            resetChannel(&ch2);
-            resetChannel(&ch3);
+            resetAllRangeChannels();
 #if VERBOSE_STARTUP
             Serial.println(F("# Position zeroed."));
 #endif
@@ -1545,6 +1586,7 @@ void setup()
     kalmanInit(&kf_dist2,  0.5f,  9.0f,  1000.0f);
     kalmanInit(&kf_dist3,  0.5f,  9.0f,  1000.0f);
     kalmanInit(&kf_dist4,  0.5f,  9.0f,  1000.0f);
+    kalmanInit(&kf_dist5,  0.5f,  9.0f,  1000.0f);
 
     posvelInit(&kf_pos_x, 0.0f, 0.0f, 1.0f, 1.0f);
     posvelInit(&kf_pos_y, 0.0f, 0.0f, 1.0f, 1.0f);
@@ -1688,13 +1730,13 @@ void loop()
     // Anti-clamp: on any axis with NO locked sensor, gently leak position
     // toward zero so dead-reckoning drift decays instead of running into the
     // display clamp. A sensor-corrected axis is skipped (held by its sensor).
-    // X is covered if EITHER X sensor (ch1 -X or ch4 +X) is locked; Y by the
-    // forward sensor (ch2); Z by the up sensor (ch3).
+    // X is covered if EITHER X sensor (ch1 -X or ch4 +X) is locked; Y by
+    // either forward sensor (ch2 or ch5); Z by the up sensor (ch3).
 #if USE_RANGE_CORRECTION
     if (POS_LEAK_TAU_S > 0.0f && !is_stationary) {
         float pleak = exp(-dt / POS_LEAK_TAU_S);
         bool x_locked = (ch1.state == 2) || (ch4.state == 2);
-        bool y_locked = (ch2.state == 2);
+        bool y_locked = (ch2.state == 2) || (ch5.state == 2);
         bool z_locked = (ch3.state == 2);
         if (!x_locked) posLeakToZero(&kf_pos_x, pleak);
         if (!y_locked) posLeakToZero(&kf_pos_y, pleak);
